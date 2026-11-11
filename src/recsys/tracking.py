@@ -1,0 +1,203 @@
+"""MLflow tracking and Model Registry helpers (spec 4.3).
+
+Backend: `MLFLOW_TRACKING_URI` if set (stages 3-4 point it at the MLflow server), otherwise a
+local SQLite store `sqlite:///mlruns/mlflow.db` with artifacts in `mlruns/artifacts`. The
+registry uses aliases (`champion`), never the deprecated stages.
+"""
+
+import hashlib
+import os
+import subprocess
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+import mlflow
+import pandas as pd
+from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
+
+from recsys.models.two_stage import TwoStageRecommender
+
+DEFAULT_TRACKING_URI = "sqlite:///mlruns/mlflow.db"
+EXPERIMENT_NAME = "movielens-recsys"
+MODEL_NAME = "movielens-recommender"
+CHAMPION_ALIAS = "champion"
+NDCG_TOLERANCE = 0.005
+MAX_COVERAGE_DROP = 0.10
+
+
+def resolve_tracking_uri(uri: str | None = None) -> str:
+    """Explicit argument > $MLFLOW_TRACKING_URI > local SQLite default."""
+    return uri or os.environ.get("MLFLOW_TRACKING_URI") or DEFAULT_TRACKING_URI
+
+
+def _sqlite_path(uri: str) -> Path | None:
+    prefix = "sqlite:///"
+    return Path(uri[len(prefix) :]) if uri.startswith(prefix) else None
+
+
+def configure_mlflow(uri: str | None = None, experiment: str = EXPERIMENT_NAME) -> str:
+    """Point MLflow at the tracking store and make sure the experiment exists.
+
+    For a local SQLite store the parent directory is created and the experiment's artifacts
+    go to `<db dir>/artifacts`; for a server the server decides. Returns the experiment id.
+    """
+    uri = resolve_tracking_uri(uri)
+    artifact_location = None
+    db = _sqlite_path(uri)
+    if db is not None:
+        db.parent.mkdir(parents=True, exist_ok=True)
+        artifact_location = (db.parent / "artifacts").resolve().as_uri()
+    mlflow.set_tracking_uri(uri)
+    existing = mlflow.get_experiment_by_name(experiment)
+    if existing is not None:
+        return existing.experiment_id
+    return mlflow.create_experiment(experiment, artifact_location=artifact_location)
+
+
+def _git(*args: str) -> str | None:
+    try:
+        out = subprocess.run(["git", *args], capture_output=True, text=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()
+
+
+def git_sha() -> str:
+    return _git("rev-parse", "HEAD") or "unknown"
+
+
+def git_dirty() -> bool:
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    return bool(status)
+
+
+def data_snapshot_hash(ratings: pd.DataFrame) -> str:
+    """Content hash of the ratings table, independent of row order."""
+    cols = ["user_id", "movie_id", "rating", "timestamp"]
+    canonical = ratings[cols].sort_values(cols[:2], kind="stable").reset_index(drop=True)
+    hashed = pd.util.hash_pandas_object(canonical, index=False).to_numpy()
+    return hashlib.sha256(hashed.tobytes()).hexdigest()[:16]
+
+
+def decide_promotion(
+    challenger: Mapping[str, float],
+    champion: Mapping[str, float] | None,
+    ndcg_tolerance: float = NDCG_TOLERANCE,
+    max_coverage_drop: float = MAX_COVERAGE_DROP,
+    k: int = 10,
+) -> tuple[bool, str]:
+    """Spec 4.2: promote if there is no champion, or NDCG@k(challenger) >= NDCG@k(champion) -
+    tolerance and coverage dropped by at most `max_coverage_drop` (relative)."""
+    if champion is None:
+        return True, "no current champion"
+    key = f"ndcg_at_{k}"
+    floor = champion[key] - ndcg_tolerance
+    if challenger[key] < floor:
+        return False, f"{key} {challenger[key]:.4f} < champion {champion[key]:.4f} - tolerance"
+    min_coverage = champion["coverage"] * (1 - max_coverage_drop)
+    if challenger["coverage"] < min_coverage:
+        return False, (
+            f"coverage {challenger['coverage']:.4f} dropped more than "
+            f"{max_coverage_drop:.0%} from champion {champion['coverage']:.4f}"
+        )
+    return True, f"{key} {challenger[key]:.4f} vs champion {champion[key]:.4f}: within tolerance"
+
+
+@dataclass(frozen=True)
+class RegistrationOutcome:
+    version: str
+    promoted: bool
+    reason: str
+    previous_champion: str | None
+    champion_metrics: dict[str, float] | None
+
+
+def _current_champion(client: MlflowClient, name: str):
+    try:
+        return client.get_model_version_by_alias(name, CHAMPION_ALIAS)
+    except MlflowException:
+        return None
+
+
+def register_and_promote(
+    model_uri: str,
+    run_id: str,
+    metrics: Mapping[str, float],
+    snapshot: str,
+    tags: Mapping[str, str] | None = None,
+    name: str = MODEL_NAME,
+    k: int = 10,
+) -> RegistrationOutcome:
+    """Register `model_uri` as a new version of `name` and move `champion` if it deserves it.
+
+    `metrics` are the served variant's test metrics. The current champion is compared only if
+    it was evaluated on the same data snapshot (same deterministic split); otherwise the alias
+    is left alone and re-evaluating the champion on the new split is left to the retraining
+    DAG (stage 4). Champion metrics are also logged into `run_id` as champion_*.
+    """
+    client = MlflowClient()
+    champion = _current_champion(client, name)
+    version = mlflow.register_model(model_uri, name).version
+    version_tags = {f"metric.{key}": f"{value:.6f}" for key, value in metrics.items()}
+    version_tags |= {"data_snapshot": snapshot, **(tags or {})}
+    for key, value in version_tags.items():
+        client.set_model_version_tag(name, version, key, value)
+
+    champion_metrics = None
+    if champion is None:
+        promoted, reason = decide_promotion(metrics, None, k=k)
+    elif champion.tags.get("data_snapshot") != snapshot:
+        promoted = False
+        reason = (
+            f"champion v{champion.version} was evaluated on data snapshot "
+            f"{champion.tags.get('data_snapshot')}, not {snapshot}; re-evaluation needed"
+        )
+    else:
+        champion_metrics = {
+            key.removeprefix("metric."): float(value)
+            for key, value in champion.tags.items()
+            if key.startswith("metric.")
+        }
+        promoted, reason = decide_promotion(metrics, champion_metrics, k=k)
+        for key, value in champion_metrics.items():
+            client.log_metric(run_id, f"champion_{key}", value)
+
+    if promoted:
+        client.set_registered_model_alias(name, CHAMPION_ALIAS, version)
+    client.set_model_version_tag(name, version, "promotion", "promoted" if promoted else "skipped")
+    client.set_model_version_tag(name, version, "promotion_reason", reason)
+    client.set_tag(run_id, "registered_version", version)
+    client.set_tag(run_id, "promoted", str(promoted).lower())
+    client.set_tag(run_id, "promotion_reason", reason)
+    return RegistrationOutcome(
+        version=str(version),
+        promoted=promoted,
+        reason=reason,
+        previous_champion=None if champion is None else str(champion.version),
+        champion_metrics=champion_metrics,
+    )
+
+
+@dataclass(frozen=True)
+class ChampionModel:
+    recommender: TwoStageRecommender
+    version: str
+    run_id: str | None
+    model_uri: str
+
+
+def load_champion(tracking_uri: str | None = None, name: str = MODEL_NAME) -> ChampionModel:
+    """Load the `champion` version of the registered model (what the API serves)."""
+    mlflow.set_tracking_uri(resolve_tracking_uri(tracking_uri))
+    model_version = MlflowClient().get_model_version_by_alias(name, CHAMPION_ALIAS)
+    model_uri = f"models:/{name}@{CHAMPION_ALIAS}"
+    pyfunc_model = mlflow.pyfunc.load_model(model_uri)
+    recommender = pyfunc_model.unwrap_python_model().recommender
+    return ChampionModel(
+        recommender=recommender,
+        version=str(model_version.version),
+        run_id=model_version.run_id,
+        model_uri=model_uri,
+    )
