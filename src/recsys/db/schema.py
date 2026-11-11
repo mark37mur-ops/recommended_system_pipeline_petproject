@@ -1,4 +1,4 @@
-"""Schema of the `app` database (spec 1, 3.4): movies, users, ratings.
+"""Schema of the `app` database (spec 1, 3.4): movies, users, ratings; retrain_runs (stage 4).
 
 SQLAlchemy Core, created idempotently with `create_schema` (`metadata.create_all`): the schema
 is small and only gains new tables before v2, which `create_all` adds; Alembic becomes worth it
@@ -10,6 +10,8 @@ never collide with (or be mistaken for) a MovieLens user.
 """
 
 from sqlalchemy import (
+    JSON,
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
@@ -74,6 +76,19 @@ ratings = Table(
     CheckConstraint("rating BETWEEN 1 AND 5", name="ratings_rating_range"),
     CheckConstraint(_SOURCE_CHECK, name="ratings_source_valid"),
     Index("ratings_movie_id_idx", "movie_id"),
+)
+
+# One row per `retrain_daily` run whose snapshot passed validation: the "previous run" of the
+# next one (the -5% row-count rule, drift against the previous run). Written by validate_data.
+retrain_runs = Table(
+    "retrain_runs",
+    metadata,
+    Column("run_id", Text, primary_key=True),
+    Column("include_web", Boolean, nullable=False),
+    Column("n_ratings", Integer, nullable=False),
+    Column("data_snapshot", Text, nullable=False),
+    Column("summary", JSON, nullable=False),  # recsys.drift.summarize_ratings
+    Column("recorded_at", DateTime(timezone=True), nullable=False),
 )
 
 

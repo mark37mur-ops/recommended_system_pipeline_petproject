@@ -18,8 +18,8 @@ def file_md5(path: Path) -> str:
     return h.hexdigest()
 
 
-def download_ml1m(dest_dir: Path, url: str = ML1M_URL, md5: str = ML1M_MD5) -> Path:
-    """Ensure ml-1m is downloaded and extracted; return ``dest_dir / "ml-1m"``."""
+def fetch_archive(dest_dir: Path, url: str = ML1M_URL, md5: str = ML1M_MD5) -> Path:
+    """Ensure ``dest_dir / "ml-1m.zip"`` exists with the expected MD5; download it if not."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive = dest_dir / "ml-1m.zip"
@@ -36,7 +36,17 @@ def download_ml1m(dest_dir: Path, url: str = ML1M_URL, md5: str = ML1M_MD5) -> P
             part.replace(archive)
         finally:
             part.unlink(missing_ok=True)
+    return archive
 
+
+def extract_archive(archive: Path, dest_dir: Path) -> Path:
+    """Unpack the archive into `dest_dir`; return ``dest_dir / "ml-1m"``."""
+    dest_dir = Path(dest_dir)
     with zipfile.ZipFile(archive) as zf:
         zf.extractall(dest_dir)
     return dest_dir / "ml-1m"
+
+
+def download_ml1m(dest_dir: Path, url: str = ML1M_URL, md5: str = ML1M_MD5) -> Path:
+    """Ensure ml-1m is downloaded and extracted; return ``dest_dir / "ml-1m"``."""
+    return extract_archive(fetch_archive(dest_dir, url, md5), dest_dir)
