@@ -75,3 +75,15 @@ jobs:
           print(sorted(n for n in names if n.startswith('mlflow')))"
       - name: API image can also train (lightgbm sklearn API needs scikit-learn)
         run: docker run --rm movielens-recsys-api:ci python -c "import lightgbm; lightgbm.LGBMRanker()"
+
+  airflow:
+    # The DAGs need Airflow, which is not in the project venv (its pins conflict with
+    # uv.lock), so the DAG integrity tests run inside the Airflow image they ship in.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -f docker/airflow.Dockerfile --build-arg GIT_SHA=${{ github.sha }} -t movielens-recsys-airflow:ci .
+      - name: DAG integrity (DagBag, graph, retries, recsys venv) inside the image
+        run: >
+          docker run --rm -v "$PWD:/repo:ro" -w /repo --entrypoint bash movielens-recsys-airflow:ci
+          -c "pip install -q pytest==9.2.0 && python -m pytest -p no:cacheprovider -v tests/dags"
