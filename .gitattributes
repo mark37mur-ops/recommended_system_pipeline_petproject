@@ -3,3 +3,4 @@
 *Dockerfile text eol=lf
 docker-compose*.yml text eol=lf
 .env.example text eol=lf
+infra/caddy/Caddyfile text eol=lf

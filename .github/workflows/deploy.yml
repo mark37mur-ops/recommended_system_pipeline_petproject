@@ -1,0 +1,225 @@
+name: Deploy
+
+# CD (spec 6.4): after CI is green on main (its `publish` job has pushed the images), log in to
+# the server over SSH and start infra/scripts/deploy.sh <tag>: checkout of the commit, pull, up,
+# smoke test (/ready + 10 recommendations), roll back to the previous tag if it fails.
+#
+# The deploy runs DETACHED on the server (`deploy.sh --detach`: its own session, output in
+# .deploy/<run>.log) and this job only polls its status file: a runner timeout, a Cancel or a
+# network blip ends the SSH session, not the deploy, and never between `up` and the rollback.
+#
+# Only the tip of main is deployed: CI runs finish in any order (a re-run of an old one, an
+# earlier push whose CI was slower), so a run whose commit is no longer the tip of main is
+# skipped, and deploy.sh itself refuses a commit older than the one running (exit 3, shown as
+# skipped). The manual run passes --allow-older: that is how to roll back on purpose.
+#
+# Until the server exists the secrets below are missing: then this workflow writes
+# "deploy skipped: server not configured" into the run summary and succeeds, so main stays
+# green without a server. Secrets (Settings -> Secrets and variables -> Actions), printed by
+# infra/scripts/bootstrap-server.sh at the end of its run:
+#   DEPLOY_HOST         server address (the IP of <ip>.sslip.io)
+#   DEPLOY_USER         SSH user on the server (deploy)
+#   DEPLOY_SSH_KEY      private key of that user, used by this workflow only
+#   DEPLOY_KNOWN_HOSTS  the server's host keys ("<host> <type> <key>" lines): the client checks
+#                       it is talking to OUR server; never StrictHostKeyChecking=no, which would
+#                       hand the key and the deploy to whoever answers on that address
+#   DEPLOY_PATH         optional, checkout on the server (default /opt/movielens-recsys)
+# Manual rollback: Actions -> Deploy -> Run workflow -> tag = sha-<7 chars> of an older commit
+# (the manual run may go back in history, automatic runs may not).
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy: sha-<7 chars of a commit on main> (older = rollback)"
+        required: true
+        type: string
+
+# Read the repository, pull the images; nothing here can write anything on GitHub.
+permissions:
+  contents: read
+  packages: read
+
+# One deploy job at a time; a newer one waits instead of cancelling the running one (the
+# server-side deploy would go on anyway, see above; deploy.sh's lock queues it there too).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # workflow_run fires for every completed CI run on main, also failed ones and pull requests
+    # from a fork's main branch: only a green CI of a push to this repository's main deploys.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    # deploy.sh at worst: lock wait 15 min + pull + smoke 5 min + rollback smoke 5 min.
+    timeout-minutes: 40
+    steps:
+      # Secrets cannot be used in `if:` directly, so a step looks at them and sets an output.
+      # None set -> skip (no server yet, green). Some set -> a half-done setup: fail loudly.
+      - name: Is a server configured?
+        id: server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          missing=()
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -eq 4 ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### deploy skipped: server not configured"
+              echo
+              echo "Set DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY and DEPLOY_KNOWN_HOSTS"
+              echo "(printed by infra/scripts/bootstrap-server.sh) to deploy automatically."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::deploy skipped: server not configured"
+          elif [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::deploy secrets incomplete, missing: ${missing[*]}"
+            exit 1
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Which version: the commit CI just tested, or the tag typed in by hand. The input goes
+      # through an environment variable and a strict pattern before any shell or SSH sees it
+      # (`${{ inputs.tag }}` pasted into a script would be a command injection), and it is not
+      # echoed back when it fails the pattern (it could carry `::` workflow commands).
+      # A CI run whose commit is no longer the tip of main is skipped (green): the newer
+      # commit gets deployed by its own run once its CI is green.
+      - name: Version to deploy
+        id: version
+        if: steps.server.outputs.configured == 'true'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            tag=$INPUT_TAG
+            ref=""  # deploy.sh takes the commit from the tag
+          else
+            tag="sha-${HEAD_SHA::7}"
+            ref=$HEAD_SHA
+          fi
+          if [[ ! $tag =~ ^sha-[0-9a-f]{7,40}$ ]] || [[ ! $ref =~ ^([0-9a-f]{40})?$ ]]; then
+            echo "::error::the tag must look like sha-1a2b3c4 (sha- and 7 to 40 lowercase hex digits)"
+            exit 1
+          fi
+          skip=false
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            tip=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            if [ "$tip" != "$HEAD_SHA" ]; then
+              skip=true
+              echo "::notice::$tag skipped: main has moved on to ${tip::7}"
+              echo "### deploy of $tag skipped: superseded by ${tip::7} on main" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "ref=$ref"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+      # The private key goes to a 600 file, the host keys to known_hosts, and an ssh config
+      # alias `server` with StrictHostKeyChecking yes: an unknown or changed host key aborts.
+      - name: SSH key and pinned host key
+        if: steps.server.outputs.configured == 'true' && steps.version.outputs.skip == 'false'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key)
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          {
+            echo "Host server"
+            echo "  HostName $DEPLOY_HOST"
+            echo "  User $DEPLOY_USER"
+            echo "  IdentityFile ~/.ssh/deploy_key"
+            echo "  IdentitiesOnly yes"
+            echo "  StrictHostKeyChecking yes"
+            echo "  UserKnownHostsFile ~/.ssh/known_hosts"
+            echo "  ServerAliveInterval 15"
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      # GHCR packages pushed from Actions are private by default. Instead of a long-lived
+      # personal token on the server, the server logs in with this job's GITHUB_TOKEN
+      # (packages: read, expires when the job ends), sent over SSH stdin, never on a command
+      # line; the last step logs out again.
+      - name: Log the server in to GHCR (token of this run only)
+        if: steps.server.outputs.configured == 'true' && steps.version.outputs.skip == 'false'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # shellcheck disable=SC2029  # $ACTOR is meant to expand here, on the runner
+          printf '%s' "$TOKEN" | ssh server "docker login ghcr.io -u '$ACTOR' --password-stdin"
+
+      # Start the deploy detached on the server, then poll its status file until it says
+      # `done <exit code>`; the server's log is printed at the end (also after a timeout).
+      # deploy.sh exit codes: 0 deployed, 3 skipped (older than the running commit), else failed.
+      - name: Deploy (detached on the server; rolls back by itself)
+        if: steps.server.outputs.configured == 'true' && steps.version.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REF: ${{ steps.version.outputs.ref }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          dir=${DEPLOY_PATH:-/opt/movielens-recsys}
+          id="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          flags=""
+          [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || flags="--allow-older"
+          # shellcheck disable=SC2029  # all of these expand on the runner (validated above)
+          ssh server "cd '$dir' && bash infra/scripts/deploy.sh --detach '$id' $flags '$TAG' $REF"
+
+          status=running
+          last=""
+          deadline=$((SECONDS + 30 * 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 10
+            # One failed poll (a network blip) is not a failed deploy: just try again.
+            # shellcheck disable=SC2029
+            status=$(ssh server "cat '$dir/.deploy/$id.status'") || continue
+            case $status in "done "*) break ;; esac
+            # shellcheck disable=SC2029
+            line=$(ssh server "tail -n 1 '$dir/.deploy/$id.log'") || true
+            [ "$line" = "$last" ] || echo "$line"
+            last=$line
+          done
+          echo "----- server log .deploy/$id.log"
+          # shellcheck disable=SC2029
+          ssh server "cat '$dir/.deploy/$id.log'" || true
+          case $status in
+            "done 0")
+              echo "### deployed $TAG" >> "$GITHUB_STEP_SUMMARY" ;;
+            "done 3")
+              echo "::notice::$TAG skipped: older than the commit running on the server"
+              echo "### deploy of $TAG skipped: older than the running version" >> "$GITHUB_STEP_SUMMARY" ;;
+            "done "*)
+              echo "::error::deploy of $TAG failed ($status), see the server log above"
+              exit 1 ;;
+            *)
+              echo "::error::no result from the server after 30 min (status: $status)"
+              exit 1 ;;
+          esac
+
+      # After a Cancel this may run while the detached deploy still pulls: the pull then fails
+      # and deploy.sh rolls back (the previous images stay on the server), which is safe.
+      - name: Log the server out of GHCR
+        if: always() && steps.server.outputs.configured == 'true' && steps.version.outputs.skip == 'false'
+        run: ssh server "docker logout ghcr.io" || true

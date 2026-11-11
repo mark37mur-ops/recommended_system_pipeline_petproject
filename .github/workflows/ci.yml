@@ -59,7 +59,7 @@ jobs:
       - run: uv run pytest -m integration -v
 
   docker:
-    # Images must build and the compose file must be valid; pushing is stage 7.
+    # Images must build and the compose file must be valid; pushing is the `publish` job below.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -98,3 +98,90 @@ jobs:
           docker run --rm -e AIRFLOW_CONSTRAINTS -v "$PWD:/repo:ro" -w /repo --entrypoint bash
           movielens-recsys-airflow:ci
           -c 'pip install -q pytest --constraint "$AIRFLOW_CONSTRAINTS" && python -m pytest -p no:cacheprovider -v tests/dags'
+
+  infra:
+    # Server-side configuration (stages 6-7). These files only "run" on the server, so a typo
+    # would otherwise surface during a deploy; here it turns the commit red instead.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The merged result is what the server runs: needs Compose >= 2.24 (`!reset`).
+      - name: Production compose override is valid
+        run: >
+          docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.prod.yml
+          --profile tools config -q
+      - name: Caddyfile is valid (the pinned Caddy image of docker-compose.prod.yml)
+        run: >
+          docker run --rm -e SITE_ADDRESS=example.sslip.io -v "$PWD/infra/caddy:/etc/caddy:ro"
+          caddy:2.11.9-alpine caddy validate --config /etc/caddy/Caddyfile
+      - name: Shell scripts pass shellcheck
+        run: >
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0
+          infra/scripts/*.sh infra/grafana/start.sh infra/postgres/init/*.sh
+      # Workflow syntax, expressions, and shellcheck on every `run:` script (deploy.yml runs
+      # only with a server, so its mistakes would otherwise show up on the first real deploy).
+      - name: Workflows pass actionlint
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 -no-color
+
+  publish:
+    # Stage 7 (spec 6.4): after every check above is green on a push to main, build the three
+    # images the server runs and push them to GitHub Container Registry. The server never
+    # builds: it pulls exactly these bytes (.github/workflows/deploy.yml, infra/scripts/deploy.sh).
+    # Pull requests and other branches stop at the checks. Third-party actions here run with a
+    # token that can write packages, so they are pinned to a commit (a moved tag cannot change
+    # them), with the version as a comment.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, integration, docker, airflow, infra]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # The only job that may write packages; every other job keeps `contents: read`.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: api
+            dockerfile: docker/api.Dockerfile
+          - image: airflow
+            dockerfile: docker/airflow.Dockerfile
+          - image: mlflow
+            dockerfile: docker/mlflow.Dockerfile
+    steps:
+      - uses: actions/checkout@v7
+      # ghcr.io/<owner>/<repo>-<image>: GHCR rejects upper case, and the owner or repository
+      # name may contain it, so lower-case it (${VAR,,} is bash for "to lower case").
+      # Tags: sha-<7 chars> is what deploy.sh deploys and rolls back to; latest is a convenience
+      # for a manual `docker pull`, never deployed by the workflow.
+      - name: Image name and tags
+        id: names
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          name="ghcr.io/${GITHUB_REPOSITORY,,}-$IMAGE"
+          echo "tags=$name:sha-${GITHUB_SHA::7},$name:latest" >> "$GITHUB_OUTPUT"
+      # Buildx with the docker-container driver: needed for the GitHub Actions layer cache.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      # GITHUB_TOKEN of this run: no personal token stored anywhere, valid until the job ends.
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: GIT_SHA=${{ github.sha }}
+          push: true
+          tags: ${{ steps.names.outputs.tags }}
+          # `source` links the package to this repository (its page, and the deploy job's
+          # GITHUB_TOKEN may pull it); `revision` says which commit is inside.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Layer cache per image in the Actions cache: unchanged dependency layers are not
+          # rebuilt (the Airflow image takes minutes from scratch). mode=max also caches the
+          # builder stages, which are not part of the final image.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

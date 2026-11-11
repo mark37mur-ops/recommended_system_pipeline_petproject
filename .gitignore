@@ -7,3 +7,6 @@ __pycache__/
 .env
 mlruns/
 .model-cache/
+/backups/
+.deploy.lock
+/.deploy/
