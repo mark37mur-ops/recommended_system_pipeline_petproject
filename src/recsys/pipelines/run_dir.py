@@ -76,6 +76,10 @@ class RunDir:
     def drift_json(self) -> Path:
         return self.root / "drift.json"
 
+    @property
+    def drift_dir(self) -> Path:  # Evidently HTML reports (stage 5)
+        return self.root / "drift"
+
     # split
     @property
     def split_dir(self) -> Path:

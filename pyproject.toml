@@ -75,4 +75,9 @@ filterwarnings = [
     # Third-party deprecations raised inside MLflow itself, not in our code.
     "ignore:The ``noload`` loader strategy is deprecated:DeprecationWarning:mlflow.store.tracking.sqlalchemy_store",
     "ignore:Operation with range is deprecated:DeprecationWarning:mlflow.models.utils",
+    # Evidently 0.7.23 and its stack under pandas 3.1 (stage-5 plan, Decision 2): deprecation
+    # noise raised inside those packages, not in our code.
+    "ignore::Warning:evidently",
+    "ignore::Warning:litestar",
+    "ignore::Warning:plotly",
 ]

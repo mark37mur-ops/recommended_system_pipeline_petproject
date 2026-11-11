@@ -1,7 +1,9 @@
+"""Drift report (spec 5.3): the stage-4 summary and the Evidently sections."""
+
 import pandas as pd
 import pytest
 
-from recsys.drift import DRIFT_ENGINE, build_drift_report, summarize_ratings
+from recsys.drift import SUMMARY_ENGINE, summarize_ratings, summary_report
 
 
 def _ratings(rows):
@@ -39,8 +41,8 @@ def test_summary_without_source_column_counts_everything_as_movielens(current):
 
 
 def test_report_without_previous_run_has_no_deltas(current):
-    report = build_drift_report(summarize_ratings(current), None)
-    assert report["engine"] == DRIFT_ENGINE
+    report = summary_report(summarize_ratings(current), None)
+    assert report["engine"] == SUMMARY_ENGINE
     assert report["previous"] is None
     assert report["deltas"] is None
     # web vs MovieLens (spec 5.3: reference = MovieLens, current = web)
@@ -49,7 +51,7 @@ def test_report_without_previous_run_has_no_deltas(current):
 
 def test_report_compares_with_previous_run(current):
     previous = summarize_ratings(current.iloc[:3])  # no web ratings yet
-    report = build_drift_report(summarize_ratings(current), previous)
+    report = summary_report(summarize_ratings(current), previous)
     deltas = report["deltas"]
     assert deltas["n_ratings_change"] == pytest.approx(1 / 3)
     assert deltas["web_share_change"] == pytest.approx(0.25)
@@ -58,7 +60,7 @@ def test_report_compares_with_previous_run(current):
 
 
 def test_report_metrics_are_flat_numbers(current):
-    report = build_drift_report(summarize_ratings(current), summarize_ratings(current))
+    report = summary_report(summarize_ratings(current), summarize_ratings(current))
     metrics = report["metrics"]
     assert metrics["drift_rating_share_tvd"] == 0.0
     assert metrics["drift_web_share"] == pytest.approx(0.25)
