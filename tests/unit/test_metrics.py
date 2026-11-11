@@ -44,6 +44,6 @@ def test_coverage():
 def test_evaluate_averages_and_missing_user_is_zero():
     test = pd.DataFrame({"user_id": [1, 2], "movie_id": [10, 20]})
     res = evaluate({1: [10]}, test, n_items=100, k=10)
-    assert res["ndcg@10"] == pytest.approx(0.5)  # (1.0 + 0.0) / 2
-    assert res["recall@10"] == pytest.approx(0.5)
+    assert res["ndcg_at_10"] == pytest.approx(0.5)  # (1.0 + 0.0) / 2
+    assert res["recall_at_10"] == pytest.approx(0.5)
     assert res["coverage"] == pytest.approx(0.01)

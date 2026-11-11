@@ -25,7 +25,7 @@ def raw_dir(tmp_path: Path) -> Path:
 
 def test_run_baseline_returns_metrics_in_unit_range(raw_dir):
     result = run_baseline(raw_dir)
-    assert set(result) == {"ndcg@10", "recall@10", "coverage"}
+    assert set(result) == {"ndcg_at_10", "recall_at_10", "coverage"}
     assert all(0.0 <= v <= 1.0 for v in result.values())
 
 
