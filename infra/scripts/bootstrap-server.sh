@@ -4,6 +4,7 @@
 #
 #   scp infra/scripts/bootstrap-server.sh root@<ip>:   # or curl it from GitHub
 #   ssh root@<ip> 'DEPLOY_PUBKEY="ssh-ed25519 AAAA... github-actions" bash bootstrap-server.sh'
+#   (add ADMIN_PUBKEY="<your own public key>" if the provider gave you a root password only)
 #
 # What it does, in order:
 #   1. packages: git, ufw, openssl, unattended-upgrades (security patches install themselves);
@@ -15,8 +16,10 @@
 #      (the admin can log in as deploy) plus DEPLOY_PUBKEY (the key GitHub Actions uses);
 #   4. firewall: incoming 22, 80, 443 only (spec 6.2). NOTE: Docker's published ports bypass
 #      ufw, which is why docker-compose.prod.yml publishes only Caddy on 0.0.0.0;
-#   5. SSH: keys only, no passwords, root only with a key. Applied only if somebody already
-#      has an authorized key, otherwise this would lock the owner out;
+#   5. SSH: keys only, no passwords, root only with a key. Applied only if root's
+#      authorized_keys holds a key other than DEPLOY_PUBKEY (the provider's, or ADMIN_PUBKEY),
+#      otherwise this would lock the owner out: `deploy` has no sudo, and the CI key is not
+#      a way for a human to get root back. sshd -t checks the result before the reload;
 #   6. 2 GB swap: insurance against the OOM killer at a training peak, not working memory;
 #   7. the repository cloned to APP_DIR (owned by deploy; deploy.sh checks out versions);
 #   8. .env from .env.example with every `change-me` replaced by a generated secret, the public
@@ -25,7 +28,8 @@
 # At the end it prints what to put into the GitHub secrets.
 #
 # Environment (optional): DEPLOY_USER (deploy), APP_DIR (/opt/movielens-recsys), REPO_URL,
-#   SITE_ADDRESS (default <primary IPv4>.sslip.io), DEPLOY_PUBKEY, SWAP_SIZE (2G, 0 = none).
+#   SITE_ADDRESS (default <primary IPv4>.sslip.io), DEPLOY_PUBKEY, ADMIN_PUBKEY,
+#   SWAP_SIZE (2G, 0 = none).
 
 set -euo pipefail
 
@@ -33,6 +37,9 @@ DEPLOY_USER=${DEPLOY_USER:-deploy}
 APP_DIR=${APP_DIR:-/opt/movielens-recsys}
 REPO_URL=${REPO_URL:-https://github.com/mark37mur-ops/recommended_system_pipeline_petproject.git}
 SWAP_SIZE=${SWAP_SIZE:-2G}
+# Overridable for the tests only (tests/unit/test_bootstrap_ssh.py).
+ROOT_KEYS=${ROOT_KEYS:-/root/.ssh/authorized_keys}
+SSHD_DROPIN_DIR=${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}
 
 log() { printf 'bootstrap: %s\n' "$*" >&2; }
 
@@ -57,6 +64,8 @@ generate_env() {
     log "$target exists, left as it is"
     return 0
   fi
+  # Written to a temporary file and renamed at the end: an interrupted run (Ctrl-C, a dropped
+  # SSH session) must not leave half a .env that the next run would keep as "exists".
   (
     umask 077  # the file holds every secret of the stack
     while IFS= read -r line || [ -n "$line" ]; do
@@ -74,7 +83,8 @@ generate_env() {
         *) [ "$value" = change-me ] && value=$(gen_token) ;;
       esac
       printf '%s=%s\n' "$key" "$value"
-    done < "$example" > "$target"
+    done < "$example" > "$target.tmp"
+    mv -f "$target.tmp" "$target"
   )
   log "$target created with generated secrets"
 }
@@ -120,7 +130,7 @@ create_user() {
   touch "$keys"
   # Add each key once (re-runs do not duplicate lines).
   {
-    [ -f /root/.ssh/authorized_keys ] && cat /root/.ssh/authorized_keys
+    [ -f "$ROOT_KEYS" ] && cat "$ROOT_KEYS"
     [ -n "${DEPLOY_PUBKEY:-}" ] && printf '%s\n' "$DEPLOY_PUBKEY"
     true
   } | while IFS= read -r key; do
@@ -141,23 +151,52 @@ setup_firewall() {
   ufw --force enable
 }
 
+# ADMIN_PUBKEY (optional): the owner's own key, added to root's authorized_keys once.
+add_admin_key() {
+  [ -n "${ADMIN_PUBKEY:-}" ] || return 0
+  [ -d "$(dirname "$ROOT_KEYS")" ] || install -d -m 700 "$(dirname "$ROOT_KEYS")"
+  touch "$ROOT_KEYS"
+  chmod 600 "$ROOT_KEYS"
+  grep -qxF "$ADMIN_PUBKEY" "$ROOT_KEYS" || printf '%s\n' "$ADMIN_PUBKEY" >> "$ROOT_KEYS"
+}
+
+# How many keys let a HUMAN in as root: lines of root's authorized_keys other than comments
+# and the CI key (DEPLOY_PUBKEY). The CI key does not count: its private half lives in GitHub
+# Secrets and `deploy` has no sudo, so with only that key nobody could get root back.
+admin_key_count() {
+  local ci
+  [ -f "$ROOT_KEYS" ] || { echo 0; return 0; }
+  ci=$(printf '%s\n' "${DEPLOY_PUBKEY:-}" | awk '{ print $2 }')
+  awk -v ci="$ci" '
+    /^[[:space:]]*(#|$)/ { next }
+    ci != "" && index($0, ci) { next }
+    { n++ }
+    END { print n + 0 }
+  ' "$ROOT_KEYS"
+}
+
 harden_ssh() {
-  local home
-  home=$(getent passwd "$DEPLOY_USER" | cut -d: -f6)
-  if [ ! -s /root/.ssh/authorized_keys ] && [ ! -s "$home/.ssh/authorized_keys" ]; then
-    log "WARNING: no authorized_keys for root or $DEPLOY_USER: password login left ON"
-    log "add your key (ssh-copy-id) and run this script again"
+  local conf=$SSHD_DROPIN_DIR/00-hardening.conf
+  if [ "$(admin_key_count)" -eq 0 ]; then
+    log "WARNING: no admin key in $ROOT_KEYS (the CI key DEPLOY_PUBKEY does not count):"
+    log "password login left ON. Add your own key (ssh-copy-id root@<ip>, or ADMIN_PUBKEY=...)"
+    log "and run this script again"
     return 0
   fi
   # sshd uses the FIRST value it reads; cloud images ship 50-cloud-init.conf with
   # PasswordAuthentication yes, so this file has to sort before it.
-  cat > /etc/ssh/sshd_config.d/00-hardening.conf <<'EOF'
+  cat > "$conf" <<'EOF'
 # Written by infra/scripts/bootstrap-server.sh: SSH keys only (spec 6.2).
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
-  sshd -t  # a broken config must not reach the running server
+  # A config sshd rejects must reach neither the running server nor the next restart.
+  if ! sshd -t; then
+    rm -f "$conf"
+    log "ERROR: sshd rejects the configuration: hardening removed again, nothing reloaded"
+    return 1
+  fi
   systemctl reload ssh
 }
 
@@ -232,6 +271,7 @@ main() {
   [ "$(id -u)" -eq 0 ] || { log "run as root"; exit 1; }
   install_packages
   install_docker
+  add_admin_key
   create_user
   setup_firewall
   harden_ssh

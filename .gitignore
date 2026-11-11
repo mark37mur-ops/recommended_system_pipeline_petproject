@@ -9,3 +9,4 @@ mlruns/
 .model-cache/
 /backups/
 .deploy.lock
+/.deploy/

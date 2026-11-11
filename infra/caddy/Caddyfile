@@ -1,9 +1,12 @@
 # Caddy: the only thing the internet talks to (spec 6.2). It terminates HTTPS, gets and renews
 # the certificate itself and decides which paths of which container are public at all.
 #
+#   raw path with .. or %2e %2f %5c %25 -> 400   never forwarded (upstreams get the raw path)
 #   /                 -> api:8000           the recommender page and its JSON API
 #   /metrics*, /admin* -> 404                internal: Prometheus scrapes /metrics and Airflow calls
 #                                            /admin/reload-model inside the compose network
+#   /ready            -> api:8000, status only ({"status":"ready"|"degraded"}, same code):
+#                                            model run id and error text stay internal
 #   /grafana/...      -> grafana:3000       ONLY the public read-only dashboard and its assets
 #   /grafana/<other>  -> 404                login, data source API, admin UI: SSH tunnel only
 #
@@ -37,9 +40,11 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 		# The page needs none of these browser features.
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
-		# Do not advertise the server software. (No Content-Security-Policy: Grafana's frontend
-		# needs inline scripts and eval, a strict policy would break it, a loose one adds little.)
+		# Do not advertise the server software, neither our own (Server) nor the proxy (Via).
+		# (No Content-Security-Policy: Grafana's frontend needs inline scripts and eval, a strict
+		# policy would break it, a loose one adds little.)
 		-Server
+		-Via
 	}
 }
 
@@ -56,7 +61,20 @@
 
 	# `handle` blocks are mutually exclusive: the first matching one wins. With named matchers
 	# Caddy keeps them in the order written here, so the order below IS the routing table.
-	# Path matching is case-insensitive and runs on the cleaned path (no `..` tricks).
+	# Path matching is case-insensitive and runs on the cleaned path; the upstream, however,
+	# receives the RAW path as the client sent it (hence block 0).
+
+	# 0. A raw path that walks directories or hides characters in percent escapes: `..`,
+	# %2e (.), %2f (/), %5c (\), %25 (double encoding), a raw backslash. The allow and block
+	# lists below match the cleaned path, but Grafana and the API would get the raw one, e.g.
+	# /grafana/api/health/../public/x is cleaned to /grafana/api/public/x and allowed, while
+	# Grafana gets the original and routes it itself (s7-review Minor-7). No URL of the page or of the public dashboard looks like
+	# this, so refuse them instead of depending on how an upstream resolves them. Only the
+	# path is checked (up to the first "?"): a search query may contain anything.
+	@traversal vars_regexp {http.request.orig_uri} `^[^?]*(\.\.|%2[eEfF]|%5[cC]|%25|\\)`
+	handle @traversal {
+		respond 400
+	}
 
 	# 1. Internal endpoints of the API. 404 rather than 403: from outside nothing is there.
 	@internal path /metrics* /admin*
@@ -81,7 +99,26 @@
 		respond 404
 	}
 
-	# 4. Everything else is the application. Caddy sets X-Forwarded-For to the real client
+	# 4. Readiness, for the outside world: the status code and one word. The API's own body
+	# (model version, MLflow run id, the text of the last load error with internal host
+	# names) is for the operator: `docker compose exec api` or Prometheus, not the internet.
+	# deploy.sh's smoke test looks at the status code only.
+	@ready path /ready
+	handle @ready {
+		reverse_proxy api:8000 {
+			@ready_ok status 2xx
+			handle_response @ready_ok {
+				header Content-Type application/json
+				respond `{"status":"ready"}` 200
+			}
+			handle_response {
+				header Content-Type application/json
+				respond `{"status":"degraded"}` 503
+			}
+		}
+	}
+
+	# 5. Everything else is the application. Caddy sets X-Forwarded-For to the real client
 	# address (it does not trust an X-Forwarded-For sent by the client: no trusted_proxies),
 	# and the API trusts that header only from the edge network (FORWARDED_ALLOW_IPS), so
 	# per-IP rate limits see visitors, not Caddy.

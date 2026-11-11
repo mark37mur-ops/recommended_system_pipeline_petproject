@@ -127,7 +127,9 @@ jobs:
     # Stage 7 (spec 6.4): after every check above is green on a push to main, build the three
     # images the server runs and push them to GitHub Container Registry. The server never
     # builds: it pulls exactly these bytes (.github/workflows/deploy.yml, infra/scripts/deploy.sh).
-    # Pull requests and other branches stop at the checks.
+    # Pull requests and other branches stop at the checks. Third-party actions here run with a
+    # token that can write packages, so they are pinned to a commit (a moved tag cannot change
+    # them), with the version as a comment.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, integration, docker, airflow, infra]
     runs-on: ubuntu-latest
@@ -159,14 +161,14 @@ jobs:
           name="ghcr.io/${GITHUB_REPOSITORY,,}-$IMAGE"
           echo "tags=$name:sha-${GITHUB_SHA::7},$name:latest" >> "$GITHUB_OUTPUT"
       # Buildx with the docker-container driver: needed for the GitHub Actions layer cache.
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
       # GITHUB_TOKEN of this run: no personal token stored anywhere, valid until the job ends.
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}

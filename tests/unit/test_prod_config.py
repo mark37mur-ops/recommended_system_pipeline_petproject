@@ -106,24 +106,58 @@ def test_proxy_trust_and_https_settings(prod):
 
 
 def caddy_routes() -> list[tuple[str, str]]:
-    """(matcher paths, what the handle block does) in file order."""
-    text = CADDYFILE.read_text(encoding="utf-8")
-    matchers = dict(re.findall(r"^\s*(@\w+) path (.+)$", text, flags=re.M))
-    routes = []
-    for name, body in re.findall(r"^\s*handle (@\w+)? ?\{\n(.*?)\n\s*\}", text, re.M | re.S):
-        routes.append((matchers.get(name, "*") if name else "*", body.strip()))
+    """(matcher, what the handle block does) in file order: "path /a /b" or "*" for the
+    catch-all, and the block's body with comments and indentation removed."""
+    lines = [
+        line.strip()
+        for line in CADDYFILE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    matchers = {}
+    for line in lines:
+        if found := re.match(r"(@\w+) (\w+ .+)$", line):
+            matchers[found[1]] = found[2]
+    routes, i = [], 0
+    while i < len(lines):
+        found = re.fullmatch(r"handle( @\w+)? \{", lines[i])
+        if not found:
+            i += 1
+            continue
+        depth, body, i = 1, [], i + 1
+        while depth:
+            depth += lines[i].count("{") - lines[i].count("}")
+            if depth:
+                body.append(lines[i])
+            i += 1
+        name = (found[1] or "").strip()
+        routes.append((matchers[name] if name else "*", "\n".join(body)))
     return routes
 
 
 def test_caddy_blocks_internal_paths_before_proxying_to_the_api():
     routes = caddy_routes()
-    assert routes[0] == ("/metrics* /admin*", "respond 404")
-    assert routes[1] == (
-        "/grafana/public-dashboards/* /grafana/api/public/* /grafana/public/*",
+    # 0: a raw path with `..` or percent-escaped . / \ % never reaches an upstream.
+    matcher, action = routes[0]
+    assert matcher.startswith("vars_regexp {http.request.orig_uri} ") and action == "respond 400"
+    pattern = re.compile(matcher.split("`")[1])
+    for bad in ("/grafana/api/health/../public/x", "/static/%2e%2e/metrics", "/a%2Fb", "/a%5cb"):
+        assert pattern.search(bad), bad
+    for good in ("/", "/movies/search?q=..%2F", "/grafana/public/build/app.1a2b.js"):
+        assert not pattern.search(good), good
+    assert routes[1] == ("path /metrics* /admin*", "respond 404")
+    assert routes[2] == (
+        "path /grafana/public-dashboards/* /grafana/api/public/* /grafana/public/*",
         "reverse_proxy grafana:3000",
     )
-    assert routes[2] == ("/grafana /grafana/*", "respond 404")
+    assert routes[3] == ("path /grafana /grafana/*", "respond 404")
+    # The public /ready answers the API's status code with one word, never the API's body.
+    matcher, action = routes[4]
+    assert matcher == "path /ready"
+    assert action.startswith("reverse_proxy api:8000 {")
+    assert 'respond `{"status":"ready"}` 200' in action
+    assert 'respond `{"status":"degraded"}` 503' in action
     assert routes[-1] == ("*", "reverse_proxy api:8000")
+    assert len(routes) == 6
     config = CADDYFILE.read_text(encoding="utf-8").splitlines()
     config = [line for line in config if not line.lstrip().startswith("#")]
     assert "{$SITE_ADDRESS} {" in config
@@ -164,3 +198,21 @@ def test_deploy_is_inert_without_secrets_and_pins_the_host_key():
     assert "StrictHostKeyChecking yes" in scripts
     assert re.search(r"StrictHostKeyChecking[ =]no", scripts) is None
     assert "${{" not in scripts  # inputs reach the shell through env only (no injection)
+
+
+def test_deploy_runs_detached_only_for_the_tip_of_main_and_rolls_back_only_by_hand():
+    """s7-review I-1/I-2: the SSH session only starts and polls the deploy; a CI run whose
+    commit is no longer the tip of main is skipped; only the manual run may go back."""
+    job = workflow("deploy.yml")["jobs"]["deploy"]
+    steps = {s["name"]: s for s in job["steps"]}
+    version = steps["Version to deploy"]
+    assert "commits/main" in version["run"] and "skip=true" in version["run"]
+    assert version["env"]["GH_TOKEN"] == "${{ github.token }}"
+    gated = [s for s in job["steps"] if s.get("id") not in ("server", "version")]
+    assert all("steps.version.outputs.skip == 'false'" in s["if"] for s in gated)
+    deploy = next(s for s in job["steps"] if s["name"].startswith("Deploy"))["run"]
+    assert "deploy.sh --detach '$id'" in deploy
+    assert ".deploy/$id.status" in deploy and '"done 0")' in deploy and '"done 3")' in deploy
+    # --allow-older is a constant chosen by the event, never text from the input.
+    assert '[ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || flags="--allow-older"' in deploy
+    assert job["timeout-minutes"] > 30  # longer than the 30-minute polling deadline

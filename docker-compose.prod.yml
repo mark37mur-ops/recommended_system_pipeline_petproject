@@ -5,8 +5,10 @@
 # (infra/scripts/deploy.sh does exactly this on every deploy; see it for the rollback.)
 # What changes and why:
 #   - images come from GHCR, tagged by git sha, instead of being built: the server builds
-#     nothing (8 GB RAM, a build would compete with the running stack), CI builds once and the
-#     same bytes that passed the tests are what runs; IMAGE_TAG in .env picks the version;
+#     nothing (8 GB RAM, a build would compete with the running stack); CI's publish job
+#     builds them from the same commit that passed the tests (a build of its own, mostly from
+#     the layer cache: the same commit, not necessarily the same bytes as the test job's
+#     build); IMAGE_TAG in .env picks the version;
 #   - Caddy is added as the single entry point on 80/443 (HTTPS, path filtering);
 #   - no other port is reachable from outside (see "Ports" below);
 #   - memory limits (one container cannot take the 8 GB server down), log rotation (stdout
