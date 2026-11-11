@@ -2,7 +2,8 @@
 # One Postgres instance, one database (and role) per component (spec 1):
 #   app    - movies, users, ratings (the API and the loader)
 #   mlflow - MLflow backend store
-#   airflow - Airflow metadata (stage 4); skipped when AIRFLOW_DB_PASSWORD is empty
+#   airflow - Airflow metadata (stage 4). Compose always sets AIRFLOW_DB_PASSWORD (`:?`);
+#             the "skip when empty" branch below is only for running this script by hand.
 # Runs automatically on the first start with an empty data volume. Idempotent: the compose
 # job `db-init` runs it again against the running server on every `docker compose up`
 # (PGHOST=postgres), which adds databases missing on an existing volume and re-applies the

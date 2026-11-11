@@ -80,10 +80,16 @@ jobs:
     # The DAGs need Airflow, which is not in the project venv (its pins conflict with
     # uv.lock), so the DAG integrity tests run inside the Airflow image they ship in.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # pytest goes in with Airflow's own constraints, so it cannot move packaging / pluggy /
+      # pygments under the Airflow being tested.
+      AIRFLOW_CONSTRAINTS: https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
     steps:
       - uses: actions/checkout@v7
       - run: docker build -f docker/airflow.Dockerfile --build-arg GIT_SHA=${{ github.sha }} -t movielens-recsys-airflow:ci .
-      - name: DAG integrity (DagBag, graph, retries, recsys venv) inside the image
+      - name: DAG integrity (DagBag, graph, retries, params, recsys venv) inside the image
         run: >
-          docker run --rm -v "$PWD:/repo:ro" -w /repo --entrypoint bash movielens-recsys-airflow:ci
-          -c "pip install -q pytest==9.2.0 && python -m pytest -p no:cacheprovider -v tests/dags"
+          docker run --rm -e AIRFLOW_CONSTRAINTS -v "$PWD:/repo:ro" -w /repo --entrypoint bash
+          movielens-recsys-airflow:ci
+          -c 'pip install -q pytest --constraint "$AIRFLOW_CONSTRAINTS" && python -m pytest -p no:cacheprovider -v tests/dags'
