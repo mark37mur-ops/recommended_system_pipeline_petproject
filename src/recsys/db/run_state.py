@@ -4,9 +4,9 @@ Plain SQLAlchemy Core without dialect-specific upserts, so unit tests run it on 
 """
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 
 from recsys.db.schema import retrain_runs
 
@@ -43,9 +43,16 @@ def record_run(engine: Engine, record: RunRecord) -> None:
                 retrain_runs.update().where(retrain_runs.c.run_id == record.run_id).values(values)
             )
         else:
+            # Strictly increasing: two quick inserts can read the same clock value (Windows
+            # ticks at ~1-16 ms), and "previous run" is decided by this column.
+            recorded_at = datetime.now(UTC)
+            last = conn.execute(select(func.max(retrain_runs.c.recorded_at))).scalar()
+            if last is not None:
+                last = last if last.tzinfo else last.replace(tzinfo=UTC)  # SQLite drops tz
+                recorded_at = max(recorded_at, last + timedelta(microseconds=1))
             conn.execute(
                 retrain_runs.insert().values(
-                    run_id=record.run_id, recorded_at=datetime.now(UTC), **values
+                    run_id=record.run_id, recorded_at=recorded_at, **values
                 )
             )
 

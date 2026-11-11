@@ -47,3 +47,23 @@ def test_record_run_is_an_upsert_that_keeps_the_original_order(engine):
     record_run(engine, _record("r1", 100))  # retry of an older run
     assert previous_run(engine, "r3", include_web=True).run_id == "r2"
     assert previous_run(engine, "r2", include_web=True).run_id == "r1"
+
+
+def test_runs_recorded_within_one_clock_tick_keep_their_order(engine, monkeypatch):
+    """Windows' clock can return the same timestamp for two quick calls; order must hold."""
+    from datetime import UTC, datetime
+
+    import recsys.db.run_state as run_state
+
+    frozen = datetime(2026, 11, 11, 12, 0, tzinfo=UTC)
+
+    class FrozenClock:
+        @staticmethod
+        def now(tz=None):
+            return frozen
+
+    monkeypatch.setattr(run_state, "datetime", FrozenClock)
+    for i, run_id in enumerate(("a", "b", "c")):
+        record_run(engine, _record(run_id, 100 + i))
+    assert previous_run(engine, "next", include_web=True).run_id == "c"
+    assert previous_run(engine, "c", include_web=True).run_id == "b"
