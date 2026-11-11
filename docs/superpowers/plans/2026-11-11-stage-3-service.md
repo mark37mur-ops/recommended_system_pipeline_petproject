@@ -68,7 +68,7 @@ tests/integration/conftest.py  tests/integration/test_db.py  tests/integration/t
 - `uv add fastapi uvicorn jinja2 pydantic-settings sqlalchemy "psycopg[binary]" redis`; `uv add --dev httpx`.
 - pytest: `pythonpath = ["services/api", "tests/unit"]`, маркер `integration`, `filterwarnings` для двух сторонних предупреждений (SQLAlchemy `noload` внутри mlflow sqlalchemy_store и pandas `Operation with range` внутри `mlflow.models.utils`) — точечно по сообщению и модулю.
 - ruff: `known-first-party = ["recsys", "recsys_api"]`.
-- [ ] `uv lock --check`, весь набор зелёный, `pytest -q` без предупреждений. Commit `chore: service deps, mlflow-skinny core dependency, pytest config`.
+- [x] `uv lock --check`, весь набор зелёный, `pytest -q` без предупреждений. Commit `chore: service deps, mlflow-skinny core dependency, pytest config`.
 
 ### Task 2: Долги этапа 2 в `recsys`
 
@@ -90,8 +90,8 @@ def load_champion(tracking_uri=None, name=MODEL_NAME, dst_dir: Path | None = Non
 def register_and_promote(..., *, beats_popularity: bool) -> RegistrationOutcome   # обязательный keyword
 # recsys.pipelines.train: CLI --tmp-dir (по умолчанию mlruns/tmp) — в контейнере /tmp/recsys
 ```
-- [ ] Тесты (RED → GREEN): `test_pin_blas_threads_skips_per_call_limits` (после `pin_blas_threads` `threadpool_limits` в `candidates_for_ratings` не вызывается — monkeypatch на исключение), `test_load_champion_does_not_touch_global_tracking_uri`, `test_load_champion_downloads_into_dst_dir_and_cleans_up`, `test_champion_version_none_without_alias`, обновлённый `test_load_champion_resolves_alias_once_and_loads_that_exact_version`, `test_register_and_promote_requires_explicit_beats_popularity`, `test_pip_requirements_pin_mlflow_skinny`, `test_cli_tmp_dir_option`.
-- [ ] Commit `fix: pin BLAS once per process, side-effect-free champion loading, explicit popularity gate`.
+- [x] Тесты (RED → GREEN): `test_pin_blas_threads_skips_per_call_limits` (после `pin_blas_threads` `threadpool_limits` в `candidates_for_ratings` не вызывается — monkeypatch на исключение), `test_load_champion_does_not_touch_global_tracking_uri`, `test_load_champion_downloads_into_dst_dir_and_cleans_up`, `test_champion_version_none_without_alias`, обновлённый `test_load_champion_resolves_alias_once_and_loads_that_exact_version`, `test_register_and_promote_requires_explicit_beats_popularity`, `test_pip_requirements_pin_mlflow_skinny`, `test_cli_tmp_dir_option`.
+- [x] Commit `fix: pin BLAS once per process, side-effect-free champion loading, explicit popularity gate`.
 
 ### Task 3: Схема БД `app` и загрузчик MovieLens
 
@@ -118,8 +118,8 @@ def load_movielens(engine, raw_dir: Path) -> LoadStats   # upsert (ON CONFLICT),
 CLI: python -m recsys.db.load_movielens [--data-dir data/raw/ml-1m] [--download] [--database-url URL]
      (по умолчанию $DATABASE_URL)
 ```
-- [ ] Unit: `test_movie_rows_join_genres_and_keep_year_null`, `test_user_rows_mark_source_movielens`, `test_web_ids_start_above_movielens_range`. Integration: `test_create_schema_is_idempotent`, `test_web_user_sequence_starts_at_web_range`, `test_check_rejects_web_user_in_movielens_range`, `test_loader_is_idempotent` (два прогона на синтетическом raw dir → одинаковые числа, source=movielens).
-- [ ] Commit `feat(db): app schema and idempotent MovieLens loader`.
+- [x] Unit: `test_movie_rows_join_genres_and_keep_year_null`, `test_user_rows_mark_source_movielens`, `test_web_ids_start_above_movielens_range`. Integration: `test_create_schema_is_idempotent`, `test_web_user_sequence_starts_at_web_range`, `test_check_rejects_web_user_in_movielens_range`, `test_loader_is_idempotent` (два прогона на синтетическом raw dir → одинаковые числа, source=movielens).
+- [x] Commit `feat(db): app schema and idempotent MovieLens loader`.
 
 ### Task 4: Бизнес-логика сервиса (без FastAPI)
 
@@ -161,8 +161,8 @@ class RecommendationService(repo, catalog_ref, holder, cache, observer):
     rate(user_id | None, ip, movie_id, rating) -> RatingResult   # лимиты, создание веб-пользователя, upsert, инвалидация кэша
 # observer.py — хуки для этапа 5 (Prometheus, impressions), по умолчанию no-op
 ```
-- [ ] Тесты (фейки: `FakeRepository`, `FakeStore`, `StubRecommender`): каталог (display title, поиск, онбординг покрывает разные жанры и детерминирован, genre_popular, popular с exclude), cookie (round-trip, подделка, чужой секрет, мусор), кэш (hit/miss, TTL передан, другая версия = промах, гонка поколений), rate limiter (31-й запрос отклонён, отдельные окна для user и IP, Redis down → разрешено), предохранитель Redis (после ошибки store не вызывается cooldown секунд), `ModelHolder` (загрузка, unchanged, ошибка оставляет старую, busy при параллельной перезагрузке, ссылка не «рвётся»), сервис (все пути таблицы 2.4, fallback при ошибке модели, Postgres down → кэш/популярное, оценённое не рекомендуется, добивка до k, веб-пользователь идёт через `recommend_new_user`).
-- [ ] Commit `feat(api): service core — catalog, cold start, cache, rate limits, model holder`.
+- [x] Тесты (фейки: `FakeRepository`, `FakeStore`, `StubRecommender`): каталог (display title, поиск, онбординг покрывает разные жанры и детерминирован, genre_popular, popular с exclude), cookie (round-trip, подделка, чужой секрет, мусор), кэш (hit/miss, TTL передан, другая версия = промах, гонка поколений), rate limiter (31-й запрос отклонён, отдельные окна для user и IP, Redis down → разрешено), предохранитель Redis (после ошибки store не вызывается cooldown секунд), `ModelHolder` (загрузка, unchanged, ошибка оставляет старую, busy при параллельной перезагрузке, ссылка не «рвётся»), сервис (все пути таблицы 2.4, fallback при ошибке модели, Postgres down → кэш/популярное, оценённое не рекомендуется, добивка до k, веб-пользователь идёт через `recommend_new_user`).
+- [x] Commit `feat(api): service core — catalog, cold start, cache, rate limits, model holder`.
 
 ### Task 5: FastAPI-приложение и страница
 
@@ -181,8 +181,8 @@ class RecommendationService(repo, catalog_ref, holder, cache, observer):
 | `POST /admin/reload-model?force=false` | `Authorization: Bearer $ADMIN_TOKEN`; 200 `loaded/unchanged`, 502 `failed` (старая модель осталась), 409 `busy`, 401 неверный токен, 503 токен не настроен |
 
 Lifespan: `pin_blas_threads()`, `create_schema`, фоновая нить грузит каталог и модель с повтором каждые `MODEL_RETRY_SECONDS`, пока не получится (сервис стартует сразу, до этого — popularity/деградация). `uvicorn --factory recsys_api.main:create_app`.
-- [ ] Тесты (TestClient + фейки): все контракты выше, cookie выдаётся один раз и подпись проверяется, подделанная cookie → новый пользователь, 5 оценок → `path=full`, повтор → `cached=true`, новая оценка → `cached=false`, 31-я оценка за минуту → 429, лимит 300 (в тесте маленький), `/ready` 503 без модели и 200 с моделью, admin reload (401/503/200/502), страница рендерится и содержит ссылки на статику.
-- [ ] Commit `feat(api): FastAPI app, endpoints and demo page`.
+- [x] Тесты (TestClient + фейки): все контракты выше, cookie выдаётся один раз и подпись проверяется, подделанная cookie → новый пользователь, 5 оценок → `path=full`, повтор → `cached=true`, новая оценка → `cached=false`, 31-я оценка за минуту → 429, лимит 300 (в тесте маленький), `/ready` 503 без модели и 200 с моделью, admin reload (401/503/200/502), страница рендерится и содержит ссылки на статику.
+- [x] Commit `feat(api): FastAPI app, endpoints and demo page`.
 
 ### Task 6: Postgres-репозиторий и интеграционные тесты API
 
@@ -196,8 +196,8 @@ class PgRepository(engine):
     upsert_rating(user_id, movie_id, rating, max_ratings) -> int   # SELECT ... FOR UPDATE строки пользователя,
         # квота считается под блокировкой; raises UserNotFound / RatingQuotaExceeded
 ```
-- [ ] Integration (`TEST_DATABASE_URL`, `TEST_REDIS_URL`): новый посетитель → 5 оценок → `full` (модель на синтетике, fold-in), кэш в настоящем Redis (`recs:{uid}:{ver}` есть, TTL ≤ 600), новая оценка инвалидирует, повторная оценка обновляет запись (unique), rate limit 429, квота 403, Redis недоступен (неверный порт) → оценки и рекомендации работают без кэша/лимитов, веб-id ≥ 1 000 000.
-- [ ] Commit `feat(api): Postgres repository and integration tests`.
+- [x] Integration (`TEST_DATABASE_URL`, `TEST_REDIS_URL`): новый посетитель → 5 оценок → `full` (модель на синтетике, fold-in), кэш в настоящем Redis (`recs:{uid}:{ver}` есть, TTL ≤ 600), новая оценка инвалидирует, повторная оценка обновляет запись (unique), rate limit 429, квота 403, Redis недоступен (неверный порт) → оценки и рекомендации работают без кэша/лимитов, веб-id ≥ 1 000 000.
+- [x] Commit `feat(api): Postgres repository and integration tests`.
 
 ### Task 7: Docker, compose, `.env.example`
 
@@ -207,13 +207,13 @@ class PgRepository(engine):
 - `mlflow.Dockerfile`: `python:3.12-slim` + `mlflow==3.18.0` (как в lock) + `psycopg[binary]`.
 - compose: `postgres` (один инстанс; init-скрипт создаёт роли и БД `app`, `mlflow`; блок `airflow` создаётся, если задан `AIRFLOW_DB_PASSWORD` — крючок этапа 4), `redis` (без persistence, maxmemory + LRU), `mlflow` (`--backend-store-uri postgresql+psycopg://…/mlflow --serve-artifacts --artifacts-destination /mlartifacts`, `MLFLOW_SERVER_ALLOWED_HOSTS`), `api`; профиль `tools`: `loader` и `trainer` (тот же образ API). Healthchecks, `depends_on: condition`, именованные тома `pgdata`, `mlartifacts`, порты внутренних сервисов на `127.0.0.1`.
 - Одна команда обучения и регистрации против сервера: `docker compose --profile tools run --rm trainer`.
-- [ ] `docker compose config -q`, сборка обоих образов. Commit `feat(docker): api and mlflow images, compose stack`.
+- [x] `docker compose config -q`, сборка обоих образов. Commit `feat(docker): api and mlflow images, compose stack`.
 
 ### Task 8: CI
 
 **Files:** `.github/workflows/ci.yml`
 - Job `test` без изменений. Job `integration`: service containers `postgres:16-alpine` и `redis:7.4-alpine` с healthcheck, `TEST_DATABASE_URL`, `TEST_REDIS_URL`, `uv run pytest -m integration -v`. Job `docker`: `docker compose config -q` (с `.env.example`) и `docker build` обоих образов (без push — этап 7).
-- [ ] Commit `ci: integration tests with Postgres/Redis services and image builds`.
+- [x] Commit `ci: integration tests with Postgres/Redis services and image builds`.
 
 ### Task 9: End-to-end в Docker и замер задержки
 
@@ -227,7 +227,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/admin/reload
 python infra/scripts/latency.py --n 100       # p95 cold (без кэша) и warm
 docker compose down                           # тома сохраняются
 ```
-- [ ] Транскрипт ключевых выводов — в отчёт этапа.
+- [x] Транскрипт ключевых выводов — в отчёт этапа.
 
 ---
 
@@ -250,3 +250,15 @@ docker compose down                           # тома сохраняются
 15. **Popularity для fallback и холодного старта — по всем оценкам в Postgres** (MovieLens + веб), из каталога в памяти; совпадает с бейзлайном spec 2.5 по смыслу (самые оцениваемые фильмы).
 16. **Онбординг:** round-robin по жанрам (порядок — по суммарному числу оценок жанра), в каждом жанре самый популярный ещё не выбранный фильм из топ-500. Жанры в ML-1M перечислены по алфавиту, поэтому «первый жанр» фильма для разнообразия не годится.
 17. **Холодный старт 1–4 оценки:** жанры фильмов с оценкой ≥4, вес жанра = число таких оценок; кандидаты — топ-500 популярных, счёт = сумма весов совпавших жанров, при равенстве — популярность. Если оценок ≥4 нет — просто популярное без оценённого.
+
+### Решения, принятые при реализации
+
+18. **`scikit-learn` — явная основная зависимость.** `LambdaRanker` использует sklearn-API LightGBM (`LGBMRanker`), а `scikit-learn` раньше приходил только транзитивно через полный `mlflow`. В образе с `mlflow-skinny` обучение падало (`LightGBMError: scikit-learn is required`) — найдено на e2e, CI-job `docker` теперь проверяет `LGBMRanker()` в образе.
+19. **MLflow server: `MLFLOW_SERVER_ENABLE_JOB_EXECUTION=false`, `--workers=1`.** MLflow 3.18 по умолчанию поднимает ~9 процессов huey для GenAI-джобов (~2.1 ГБ RSS); для tracking + registry они не нужны. Итог ~380 МБ (spec 6.1 закладывает ~0.3 ГБ).
+20. **`_current_champion` считает «нет чемпиона» только по кодам not-found** (`RESOURCE_DOES_NOT_EXIST`, `INVALID_PARAMETER_VALUE`). Раньше любая ошибка реестра означала «чемпиона нет»: API писал неверную причину, а `register_and_promote` при недоступном реестре продвинул бы модель без сравнения.
+21. **`load_champion` сам разрешает место хранения версии** (`get_model_version_download_uri` → для MLflow 3 `models:/m-…` → `get_logged_model().artifact_location`) и качает его с явными URI: `download_artifacts("models:/name/v", tracking_uri=…)` в mlflow 3.18 всё равно ходит в глобальный registry URI (`ModelsArtifactRepository._get_model_uri_infos`).
+22. **Загрузчик в compose скачивает ML-1M в именованный том `movielens`** (общий для `loader` и `trainer`, на этапе 4 его же подключит Airflow), а не в bind-mount `./data`: на VPS не будет проблем с правами каталога хоста. Каталог `/data` в образе принадлежит пользователю `app`, поэтому новый том наследует владельца.
+23. **Порты внутренних сервисов на хосте настраиваются в `.env`** (`POSTGRES_PORT`, `REDIS_PORT`, `MLFLOW_PORT`): на машине разработки порт 5432 занят нативным Postgres 18, локально использован `POSTGRES_PORT=15432`.
+24. **`httpx2` вместо `httpx` для TestClient** — Starlette 1.10 объявила `httpx` устаревшим для `starlette.testclient`.
+25. **MLflow-клиент в API: `MAX_RETRIES=1`, `BACKOFF_FACTOR=1`, `TIMEOUT=10`.** При остановленном MLflow `reload-model` возвращает 502 примерно за 16 с (время уходит на DNS-ошибку контейнера), старая модель продолжает работать.
+26. **`RATE_LIMIT_PER_MINUTE` пробрасывается в compose** (по умолчанию 30) — только для замера задержки (`infra/scripts/latency.py` создаёт 100 посетителей с одного IP).
