@@ -7,14 +7,21 @@ authors = [
 ]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "fastapi>=0.162.4",
     "implicit>=0.7.3",
+    "jinja2>=3.1.6",
     "lightgbm>=4.7.0",
-    "mlflow>=3.18.0",
+    "mlflow-skinny>=3.18.0",
     "numpy>=2.5.4",
     "pandas>=3.1.1",
+    "psycopg[binary]>=3.3.8",
     "pyarrow>=26.0.1",
+    "pydantic-settings>=2.16.2",
+    "redis>=8.1.0",
     "scipy>=1.18.1",
+    "sqlalchemy>=2.1.8",
     "threadpoolctl>=3.8.0",
+    "uvicorn>=0.54.0",
 ]
 
 [build-system]
@@ -23,13 +30,22 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=9.2.0",
     "ruff>=0.17.4",
+]
+mlflow-store = [
+    "mlflow>=3.18.0",
 ]
 notebooks = [
     "jupyter>=1.1.1",
     "matplotlib>=3.11.2",
 ]
+
+[tool.uv]
+# `uv sync` installs the full MLflow (local sqlite store, server) next to the dev tools; the API
+# image installs only the core dependencies (mlflow-skinny client) with --no-default-groups.
+default-groups = ["dev", "mlflow-store"]
 
 [tool.ruff]
 line-length = 100
@@ -39,5 +55,17 @@ extend-exclude = ["docs", ".superpowers"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["recsys", "recsys_api"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["services/api", "tests/unit"]
+markers = [
+    "integration: needs real Postgres and Redis (TEST_DATABASE_URL, TEST_REDIS_URL); skipped otherwise",
+]
+filterwarnings = [
+    # Third-party deprecations raised inside MLflow itself, not in our code.
+    "ignore:The ``noload`` loader strategy is deprecated:DeprecationWarning:mlflow.store.tracking.sqlalchemy_store",
+    "ignore:Operation with range is deprecated:DeprecationWarning:mlflow.models.utils",
+]
