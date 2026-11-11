@@ -62,16 +62,25 @@ COOKIE_MAX_AGE = 365 * 24 * 3600
 RELOAD_STATUS_CODES = {"loaded": 200, "unchanged": 200, "failed": 502, "busy": 409}
 
 
-def _configure_logging(level: str, fmt: str) -> None:
-    if configure_logging(level, fmt):
-        # uvicorn gives its own loggers text handlers before it builds the app; send them
-        # through the root handler instead, so its start-up and error lines are JSON too.
-        # (Its per-request access log is off, see docker/api.Dockerfile: MetricsMiddleware
-        # writes one line per request with the route template instead of the raw URL.)
-        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-            uvicorn_log = logging.getLogger(name)
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def route_uvicorn_logs() -> None:
+    """uvicorn gives its loggers text handlers before it builds the app; send them through the
+    root (JSON) handler instead, so its start-up and error lines are JSON too. A logger uvicorn
+    switched off has no handlers and does not propagate (`--no-access-log`, see
+    docker/api.Dockerfile: MetricsMiddleware writes one line per request instead, with the
+    route template rather than the raw URL); it stays off."""
+    for name in UVICORN_LOGGERS:
+        uvicorn_log = logging.getLogger(name)
+        if uvicorn_log.handlers:
             uvicorn_log.handlers.clear()
             uvicorn_log.propagate = True
+
+
+def _configure_logging(level: str, fmt: str) -> None:
+    if configure_logging(level, fmt):
+        route_uvicorn_logs()
     logging.getLogger("recsys_api").setLevel(level)
 
 

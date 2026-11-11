@@ -1,5 +1,5 @@
 # Local stack (spec 1, 6.2): Postgres (app, mlflow, airflow DBs), Redis, MLflow server, API,
-# Airflow (api-server + scheduler + dag-processor, LocalExecutor).
+# Airflow (api-server + scheduler + dag-processor, LocalExecutor), Prometheus + Grafana (spec 5).
 #   cp .env.example .env   # and replace every change-me (the API and Airflow refuse them)
 #   docker compose up -d --build
 #   Airflow UI http://localhost:8080 (user admin, password AIRFLOW_ADMIN_PASSWORD):
@@ -8,9 +8,12 @@
 #   docker compose --profile tools run --rm loader    # MovieLens 1M -> Postgres (idempotent)
 #   docker compose --profile tools run --rm trainer   # train + register champion on MLflow
 #   curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/admin/reload-model
-# Every port is published on 127.0.0.1 of the host only (MLflow and Airflow have to be reached
-# over an SSH tunnel on the server; the API through Caddy in docker-compose.prod.yml, stage 6).
-# Stage 5 adds Prometheus + Grafana, stage 6 Caddy in docker-compose.prod.yml.
+#   Grafana http://localhost:3000 (user admin, password GRAFANA_ADMIN_PASSWORD); the public
+#     read-only link is printed by `docker compose logs grafana-publish`.
+#   Prometheus http://localhost:9090 (Status -> Targets: is the API scraped?).
+# Every port is published on 127.0.0.1 of the host only (MLflow, Airflow, Prometheus and the
+# Grafana admin UI have to be reached over an SSH tunnel on the server; the API and the public
+# dashboard through Caddy in docker-compose.prod.yml, stage 6, which must NOT proxy /metrics).
 name: movielens-recsys
 
 x-api-image: &api-image
@@ -30,6 +33,8 @@ x-db-passwords: &db-passwords
   APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
   MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?set MLFLOW_DB_PASSWORD in .env}
   AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
+  # Read-only role grafana_reader (stage 5): Grafana's view of the app database.
+  GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set GRAFANA_DB_PASSWORD in .env}
 
 # Shared by every Airflow container. Why these settings:
 # - LocalExecutor: tasks run as subprocesses of the scheduler; no Celery workers and queue on
@@ -177,6 +182,8 @@ services:
       MLFLOW_HTTP_REQUEST_MAX_RETRIES: "1"
       MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR: "1"
       MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
+      # No tqdm progress bar while the champion downloads: it is not a JSON log line.
+      MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR: "false"
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
@@ -191,6 +198,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # The API creates the monitoring views and grants them to grafana_reader at start-up;
+      # db-init creates that role, so it has to run first.
+      db-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       # Not "healthy": the API starts without MLflow (popularity fallback) and retries.
@@ -291,6 +302,116 @@ services:
       start_period: 60s
       retries: 5
 
+  # ----- Monitoring (spec 5) ---------------------------------------------------------------
+  # Prometheus pulls /metrics from the API every 15 s (infra/prometheus/prometheus.yml) and keeps
+  # 7 days or 512 MB of samples, whichever is smaller: enough for the dashboard and the alerts,
+  # small for one 8 GB server.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=512MB
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+
+  # Same policy as airflow-init: refuse placeholder or short Grafana secrets before Grafana
+  # starts (the Grafana image has no Python, the API image has recsys.secrets_check).
+  grafana-init:
+    <<: *api-image
+    restart: "no"
+    command: ["python", "-m", "recsys.secrets_check", "grafana"]
+    environment:
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GRAFANA_SECRET_KEY: ${GRAFANA_SECRET_KEY:?set GRAFANA_SECRET_KEY in .env}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set GRAFANA_DB_PASSWORD in .env}
+
+  # Dashboards, data sources and alert rules all come from infra/grafana (provisioning): the
+  # Grafana volume only holds users, sessions, alert state and the public-dashboard token.
+  grafana:
+    image: grafana/grafana:13.2.5
+    restart: unless-stopped
+    # Assembles the provisioning directory (Telegram only when configured), then runs the
+    # image's own entrypoint; see infra/grafana/start.sh.
+    entrypoint: ["sh", "/etc/grafana/start.sh"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # Encrypts data source passwords in Grafana's database; the built-in default is public.
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY:?set GRAFANA_SECRET_KEY in .env}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      # Only the admin logs in; visitors see the public dashboard link (no account, no login).
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # Grafana 13 downloads ~180 MB of "preinstalled" app plugins at start and then uses
+      # ~660 MB RAM; without them ~250 MB. Prometheus and Postgres sources are built in.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # JSON lines on stdout, like the API (spec 5.6).
+      GF_LOG_CONSOLE_FORMAT: json
+      # Stage 6 sets it to https://<host>/grafana/ (and serves from that sub-path behind Caddy).
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000/}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana-dashboards/recsys.json
+      # Referenced from the provisioning files as ${...}; Grafana substitutes them at start-up.
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set GRAFANA_DB_PASSWORD in .env}
+      # Optional (spec 5.5): both empty -> no Telegram contact point, alerts in the UI only.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./infra/grafana/start.sh:/etc/grafana/start.sh:ro
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning-repo:ro
+      - ./infra/grafana/telegram.yml:/etc/grafana/telegram.yml:ro
+      - ./infra/grafana/telegram-off.yml:/etc/grafana/telegram-off.yml:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana-dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      grafana-init:
+        condition: service_completed_successfully
+      # The read-only role its Postgres data source logs in with.
+      db-init:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+
+  # One-shot after every start: makes sure the dashboard has its public read-only copy and
+  # prints the link (file provisioning cannot do this; see infra/grafana/publish_dashboard.py).
+  grafana-publish:
+    <<: *api-image
+    restart: "no"
+    command: ["python", "/scripts/publish_dashboard.py"]
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GRAFANA_PUBLIC_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3000}
+    volumes:
+      - ./infra/grafana/publish_dashboard.py:/scripts/publish_dashboard.py:ro
+    depends_on:
+      grafana:
+        condition: service_healthy
+
   # ----- one-off jobs (docker compose --profile tools run --rm <name>) -------------------
   loader:
     <<: *api-image
@@ -330,3 +451,5 @@ volumes:
   # to the API image's user (uid 10001); Airflow runs as uid 50000.
   airflow-data:
   airflow-logs:  # task logs: written by the scheduler, read by the api-server for the UI
+  prometheus-data:  # time series (7 days / 512 MB)
+  grafana-data:  # Grafana's own SQLite: admin user, alert state, public-dashboard token

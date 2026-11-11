@@ -1,0 +1,49 @@
+# Grafana data sources, created at start-up from this file ("provisioning"): the setup lives in
+# git instead of being clicked together in the UI, and a fresh Grafana volume comes back
+# identical. Fixed uids, because the dashboard JSON and the alert rules refer to them.
+apiVersion: 1
+
+# Remove sources that were provisioned before under these names, then recreate them: edits of
+# this file always win over changes made in the UI.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: App database
+    orgId: 1
+
+datasources:
+  # Service metrics (spec 5.1). Grafana's backend talks to Prometheus inside the compose network
+  # ("proxy" access); the browser never needs to reach Prometheus.
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Matches the scrape interval, so $__rate_interval never drops below 4 samples.
+      timeInterval: 15s
+      httpMethod: POST
+
+  # The `app` database (spec 5.2-5.4: online metric, drift_share, NDCG of the last runs), read
+  # as `grafana_reader`: created by infra/postgres/init with default_transaction_read_only and
+  # a 5 s statement_timeout, and granted SELECT only on recsys.db.schema.DASHBOARD_OBJECTS
+  # (views and metric tables, not the raw ratings/users tables).
+  - name: App database
+    uid: app-postgres
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: postgres:5432
+    user: grafana_reader
+    editable: false
+    jsonData:
+      database: app
+      sslmode: disable  # internal Docker network only
+      postgresVersion: 1600
+      maxOpenConns: 5
+      maxIdleConns: 2
+    secureJsonData:
+      # Grafana substitutes environment variables in provisioning files; the value comes
+      # from .env through docker-compose.yml and is stored encrypted with GF_SECURITY_SECRET_KEY.
+      password: ${GRAFANA_DB_PASSWORD}

@@ -31,6 +31,30 @@ def test_extra_fields_become_keys_and_odd_values_are_stringified():
     assert "args" not in data and "msg" not in data  # LogRecord internals stay out
 
 
+def test_uvicorn_colour_copy_of_the_message_is_dropped():
+    data = json.loads(JsonFormatter().format(_record(color_message="[36mhello[0m")))
+    assert "color_message" not in data and data["message"] == "hello world"
+
+
+def test_uvicorn_loggers_go_through_root_but_a_disabled_access_log_stays_off():
+    from recsys_api.main import UVICORN_LOGGERS, route_uvicorn_logs
+
+    loggers = [logging.getLogger(name) for name in UVICORN_LOGGERS]
+    saved = [(lg.handlers[:], lg.propagate) for lg in loggers]
+    try:
+        server, error, access = loggers
+        server.handlers, server.propagate = [logging.NullHandler()], False  # uvicorn's text
+        error.handlers, error.propagate = [], True
+        access.handlers, access.propagate = [], False  # what --no-access-log leaves behind
+        route_uvicorn_logs()
+        assert (server.handlers, server.propagate) == ([], True)
+        assert (error.handlers, error.propagate) == ([], True)
+        assert (access.handlers, access.propagate) == ([], False)
+    finally:
+        for lg, (handlers, propagate) in zip(loggers, saved, strict=True):
+            lg.handlers, lg.propagate = handlers, propagate
+
+
 def test_exception_is_one_field():
     try:
         raise ValueError("boom")

@@ -1,0 +1,178 @@
+# Alert rules of spec 5.5, evaluated by Grafana Alerting every minute against Prometheus.
+# Where notifications go is decided by the notification policy: infra/grafana/telegram.yml
+# (added by infra/grafana/start.sh only when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set;
+# otherwise Grafana's default policy applies, whose receiver "empty" has no integrations: alerts
+# fire and are visible in the Grafana UI, nothing is sent).
+#
+# Every rule is: A = an instant PromQL query, C = a threshold on A. `for` is how long the
+# condition must hold before the alert fires (pending -> firing). The spec's time windows live
+# in the PromQL range ([5m], [10m]); the rate over that window is what is compared.
+#
+# No data: a ratio with no traffic is 0/0 = NaN or an empty result, which is not a problem, so
+# those rules treat "no data" as OK. "API is down" is the exception: no `up` series at all means
+# Prometheus is not scraping the API, which is as bad as a failed scrape.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: recsys
+    folder: Recsys
+    interval: 1m
+    rules:
+      - uid: recsys-api-down
+        title: API is down
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: up{job="api"}
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+        # Spec: up == 0 for longer than 2 minutes (one restart of the container is not paged).
+        for: 2m
+        noDataState: Alerting
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: The API has not answered Prometheus scrapes for 2 minutes.
+          description: >-
+            up{job="api"} is 0. Check `docker compose ps api` and `docker compose logs api`.
+
+      - uid: recsys-api-5xx
+        title: Share of 5xx responses above 5%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # `or vector(0)`: no 5xx series exists until the first error; with it the ratio is
+              # 0 instead of "no data". Prometheus' own scrapes of /metrics are not traffic.
+              expr: >-
+                (sum(rate(http_requests_total{job="api",endpoint!="/metrics",status=~"5.."}[5m]))
+                or vector(0))
+                / sum(rate(http_requests_total{job="api",endpoint!="/metrics"}[5m]))
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.05]}
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: More than 5% of API responses were 5xx over the last 5 minutes.
+          description: >-
+            Look at http_requests_total by endpoint and status on the dashboard and at the
+            API's JSON logs (status >= 500).
+
+      - uid: recsys-api-latency
+        title: p95 latency above 300 ms
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # User-facing routes only: scrapes, probes, the admin reload (seconds by design)
+              # and 404s would distort the visitor's latency.
+              expr: >-
+                histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="api",endpoint!~"/metrics|/health|/ready|/admin/.*|unmatched"}[10m])))
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.3]}
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: The 95th percentile of API latency was above 300 ms over the last 10 minutes.
+          description: >-
+            Target is p95 < 100 ms (spec 3.5). Usual suspects: Postgres slow, Redis down (no
+            cache), inference contention (one inference at a time).
+
+      - uid: recsys-fallback-share
+        title: Share of fallback recommendations above 20%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: >-
+                sum(rate(recommendations_served_total{job="api",path="fallback"}[10m]))
+                / sum(rate(recommendations_served_total{job="api"}[10m]))
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.2]}
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical}
+        annotations:
+          summary: More than 20% of recommendations over 10 minutes were popular-movie fallbacks.
+          description: >-
+            The model is missing or failing (spec 3.5). Check /ready (model.last_error),
+            model_errors_total and the API logs.
+
+      - uid: recsys-model-age
+        title: Served model older than 36 hours
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # Age = now - creation time of the served version in the MLflow registry
+              # (stage-5 plan, Decision 8). The API's load time would reset on every restart
+              # and hide a broken nightly retrain.
+              expr: time() - max(model_created_timestamp_seconds{job="api"})
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [129600]}  # 36 h in seconds
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning}
+        annotations:
+          summary: The champion model is older than 36 hours.
+          description: >-
+            retrain_daily has not produced a new champion for 1.5 days: it is failing, or every
+            challenger was rejected. Check the DAG runs in Airflow and decision tags in MLflow.

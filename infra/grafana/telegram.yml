@@ -1,0 +1,31 @@
+# Telegram notifications (spec 5.5). Not in provisioning/ on purpose: Grafana refuses to start
+# when a Telegram contact point has an empty bot token, so infra/grafana/start.sh copies this
+# file into the provisioning directory only when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are
+# both set in .env.
+#   Bot token: talk to @BotFather in Telegram, /newbot.
+#   Chat id: send the bot a message, then open https://api.telegram.org/bot<token>/getUpdates
+#   and take message.chat.id. Test from the UI: Alerting -> Contact points -> telegram -> Test.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: telegram
+    receivers:
+      - uid: recsys-telegram
+        type: telegram
+        settings:
+          bottoken: ${TELEGRAM_BOT_TOKEN}
+          chatid: ${TELEGRAM_CHAT_ID}
+        # "Resolved" messages too: knowing that the API is back is as useful as the alarm.
+        disableResolveMessage: false
+
+# The root notification policy: every alert of org 1 goes to Telegram.
+policies:
+  - orgId: 1
+    receiver: telegram
+    # One message per alert rule, not one per label combination.
+    group_by: ["grafana_folder", "alertname"]
+    # Wait a little for related alerts to group, re-send a still-firing alert every 4 hours.
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h

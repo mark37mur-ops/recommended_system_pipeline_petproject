@@ -12,9 +12,11 @@ from datetime import UTC, datetime
 from typing import TextIO
 
 # Attributes every LogRecord has; anything else on a record came in through `extra=`.
+# color_message: uvicorn's copy of the message with terminal colour codes.
 _RECORD_FIELDS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {
     "message",
     "asctime",
+    "color_message",
 }
 TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _MARKER = "_recsys_handler"

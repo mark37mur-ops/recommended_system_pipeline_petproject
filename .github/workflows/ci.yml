@@ -64,6 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker compose --env-file .env.example --profile tools config -q
+      - name: Prometheus config is valid (promtool from the pinned image)
+        run: >
+          docker run --rm --entrypoint promtool -v "$PWD/infra/prometheus:/cfg:ro"
+          prom/prometheus:v3.15.1 check config /cfg/prometheus.yml
       - run: docker build -f docker/api.Dockerfile --build-arg GIT_SHA=${{ github.sha }} -t movielens-recsys-api:ci .
       - run: docker build -f docker/mlflow.Dockerfile -t movielens-recsys-mlflow:ci .
       - name: API image imports the service and ships only the MLflow client

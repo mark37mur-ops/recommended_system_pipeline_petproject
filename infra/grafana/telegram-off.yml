@@ -1,0 +1,13 @@
+# Counterpart of telegram.yml, copied by infra/grafana/start.sh when TELEGRAM_BOT_TOKEN or
+# TELEGRAM_CHAT_ID is empty. Why it is needed: Grafana keeps provisioned alerting objects in its
+# own database, and removing a file does not remove them. Without this, a Telegram contact point
+# from an earlier start (token since removed from .env) would stay and keep being used.
+apiVersion: 1
+
+# Back to Grafana's default notification policy (its built-in default contact point).
+resetPolicies:
+  - 1
+
+deleteContactPoints:
+  - orgId: 1
+    uid: recsys-telegram

@@ -27,13 +27,14 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_CACHE_DIR=/root/.cache/uv \
     VIRTUAL_ENV=
 WORKDIR /build
-# Dependencies first (cached layer), then the package itself.
+# Dependencies first (cached layer), then the package itself. `--group drift` adds Evidently
+# for the drift_report task (stage 5); the API image does not need it and does not get it.
 COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-default-groups --no-install-project
+    uv sync --frozen --no-default-groups --group drift --no-install-project
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-default-groups --no-editable
+    uv sync --frozen --no-default-groups --group drift --no-editable
 
 # ----- stage 2: Airflow + the venv ------------------------------------------------------------
 FROM ${AIRFLOW_IMAGE}

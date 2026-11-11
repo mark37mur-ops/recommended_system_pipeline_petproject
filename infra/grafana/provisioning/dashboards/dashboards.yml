@@ -1,0 +1,18 @@
+# Dashboards as code: Grafana loads every JSON file in /var/lib/grafana-dashboards (mounted from
+# infra/grafana/dashboards) at start-up and re-reads it every 30 s.
+apiVersion: 1
+
+providers:
+  - name: recsys
+    orgId: 1
+    folder: Recsys
+    folderUid: recsys
+    type: file
+    # The file in git is the source of truth: edits in the UI cannot be saved (export the JSON
+    # and commit it instead), so the repository and the running Grafana never disagree.
+    allowUiUpdates: false
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana-dashboards
+      foldersFromFilesStructure: false
