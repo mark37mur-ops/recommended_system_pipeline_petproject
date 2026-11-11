@@ -18,9 +18,15 @@ def temporal_split(
     """Split each user's history by time: oldest -> als_train, then ranker_train, then test.
 
     Users with fewer than `min_ratings` ratings go entirely to als_train. Ties in timestamp
-    are broken by movie_id ascending, so the split is deterministic.
+    are broken by a deterministic hash of (user_id, movie_id), so the split does not depend on
+    input row order and is not biased by movie_id (which correlates with when a movie was added).
     """
-    df = ratings.sort_values(["user_id", "timestamp", "movie_id"], kind="stable")
+    tie_break = pd.util.hash_pandas_object(ratings[["user_id", "movie_id"]], index=False)
+    df = (
+        ratings.assign(_tie=tie_break)
+        .sort_values(["user_id", "timestamp", "_tie"], kind="stable")
+        .drop(columns="_tie")
+    )
     grouped = df.groupby("user_id", sort=False)
     pos_from_end = grouped.cumcount(ascending=False)
     long_enough = grouped["user_id"].transform("size") >= min_ratings
