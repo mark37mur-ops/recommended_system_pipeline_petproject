@@ -1,14 +1,16 @@
-# Local stack (spec 1, 6.2): Postgres (app + mlflow DBs), Redis, MLflow server, API.
+# Local stack (spec 1, 6.2): Postgres (app, mlflow, airflow DBs), Redis, MLflow server, API,
+# Airflow (api-server + scheduler + dag-processor, LocalExecutor).
 #   cp .env.example .env   # and replace every change-me (the API refuses to start with them)
 #   docker compose up -d --build
+#   Airflow UI http://localhost:8080 (user admin, password AIRFLOW_ADMIN_PASSWORD):
+#     trigger bootstrap_data once (MovieLens 1M -> Postgres), then unpause retrain_daily.
+#   One-off jobs without Airflow (stage 3, still work):
 #   docker compose --profile tools run --rm loader    # MovieLens 1M -> Postgres (idempotent)
 #   docker compose --profile tools run --rm trainer   # train + register champion on MLflow
 #   curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/admin/reload-model
-# Every port is published on 127.0.0.1 of the host only (MLflow has no auth of its own; the
-# API is reached from other machines through Caddy in docker-compose.prod.yml, stage 6).
-# Stage 4 adds Airflow (its database
-# is created by the Postgres init script when AIRFLOW_DB_PASSWORD is set), stage 5
-# Prometheus + Grafana, stage 6 Caddy in docker-compose.prod.yml.
+# Every port is published on 127.0.0.1 of the host only (MLflow and Airflow have to be reached
+# over an SSH tunnel on the server; the API through Caddy in docker-compose.prod.yml, stage 6).
+# Stage 5 adds Prometheus + Grafana, stage 6 Caddy in docker-compose.prod.yml.
 name: movielens-recsys
 
 x-api-image: &api-image
@@ -22,16 +24,63 @@ x-api-image: &api-image
 x-app-db: &app-db
   DATABASE_URL: postgresql+psycopg://app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@postgres:5432/app
 
+x-db-passwords: &db-passwords
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+  MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?set MLFLOW_DB_PASSWORD in .env}
+  AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
+
+# Shared by every Airflow container. Why these settings:
+# - LocalExecutor: tasks run as subprocesses of the scheduler; no Celery workers and queue on
+#   a single 8 GB server;
+# - one api-server worker, one DAG-parsing process, parallelism 2: Airflow stays around
+#   1-1.5 GB idle (the training task itself peaks at ~1 GB inside the scheduler container);
+# - JWT secret and API secret key are shared: in Airflow 3 task processes talk to the
+#   api-server's Execution API with JWTs, so every component must sign with the same key;
+# - DATABASE_URL, MLflow, API, ADMIN_TOKEN and /data are for the recsys task processes,
+#   which inherit this environment.
+x-airflow: &airflow
+  image: movielens-recsys-airflow:local
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+    args:
+      GIT_SHA: ${GIT_SHA:-unknown}
+  restart: unless-stopped
+  environment: &airflow-env
+    <<: *app-db
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?set AIRFLOW_API_SECRET_KEY in .env}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__PARALLELISM: "2"
+    AIRFLOW__API__WORKERS: "1"
+    AIRFLOW__DAG_PROCESSOR__PARSING_PROCESSES: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: ${AIRFLOW_ADMIN_USER:-admin}:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/simple_auth_manager_passwords.json
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_HTTP_REQUEST_MAX_RETRIES: "3"
+    MLFLOW_HTTP_REQUEST_TIMEOUT: "60"
+    API_URL: http://api:8000
+    ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+    RUNS_DIR: /data/runs
+    RAW_DIR: /data/raw
+  volumes:
+    - airflow-data:/data
+    - airflow-logs:/opt/airflow/logs
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
-      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?set MLFLOW_DB_PASSWORD in .env}
-      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-}  # stage 4
+      <<: *db-passwords
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -44,6 +93,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # The scripts in /docker-entrypoint-initdb.d run only on an empty data volume. This one-shot
+  # job runs the same idempotent script against the running server on every `up`, so an
+  # existing volume (from stage 3) gets the airflow database and role passwords follow .env.
+  db-init:
+    image: postgres:16-alpine
+    restart: "no"
+    entrypoint: ["sh", "/init/01-create-databases.sh"]
+    environment:
+      <<: *db-passwords
+      PGHOST: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./infra/postgres/init:/init:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   redis:
     image: redis:7.4-alpine
@@ -135,6 +201,79 @@ services:
       start_period: 20s
       retries: 5
 
+  # ----- Airflow (spec 4) ------------------------------------------------------------------
+  # Creates or upgrades Airflow's metadata schema, then exits; the others wait for it.
+  airflow-init:
+    <<: *airflow
+    restart: "no"
+    command: ["airflow", "db", "migrate"]
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  # UI + REST API + the Execution API the task processes report to.
+  airflow-apiserver:
+    <<: *airflow
+    # SimpleAuthManager (the Airflow 3 default) reads passwords from a JSON file and generates
+    # random ones for users missing from it. Writing the file from .env first gives a known
+    # admin password and no generated password in the logs.
+    command:
+      - bash
+      - -c
+      - >-
+        python -c "import json, os; json.dump({os.environ['AIRFLOW_ADMIN_USER']:
+        os.environ['AIRFLOW_ADMIN_PASSWORD']},
+        open(os.environ['AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE'], 'w'))"
+        && exec airflow api-server
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/v2/monitor/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 10
+
+  # Decides what runs when; with LocalExecutor the tasks also run here, as subprocesses.
+  airflow-scheduler:
+    <<: *airflow
+    command: ["airflow", "scheduler"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      # Task processes report to the api-server's Execution API.
+      airflow-apiserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8974/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 10
+
+  # Airflow 3 parses DAG files in a separate process; the scheduler no longer does it.
+  airflow-dag-processor:
+    <<: *airflow
+    command: ["airflow", "dag-processor"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob", "--local"]
+      interval: 60s
+      timeout: 30s
+      start_period: 60s
+      retries: 5
+
   # ----- one-off jobs (docker compose --profile tools run --rm <name>) -------------------
   loader:
     <<: *api-image
@@ -152,8 +291,8 @@ services:
   trainer:
     <<: *api-image
     profiles: ["tools"]
-    # Stage 3 trains on the raw MovieLens files; stage 4's DAG extracts ratings (incl. web)
-    # from Postgres instead. The model is registered on the MLflow server, artifacts are
+    # Trains on the raw MovieLens files (no web ratings); retrain_daily in Airflow extracts
+    # ratings, incl. web, from Postgres instead. The model is registered on the MLflow server, artifacts are
     # uploaded over HTTP (mlflow-artifacts:/), so no volume is shared with MLflow.
     command: ["python", "-m", "recsys.pipelines.train",
               "--data-dir", "/data/raw/ml-1m", "--tmp-dir", "/tmp/recsys"]
@@ -169,3 +308,8 @@ volumes:
   pgdata:
   mlartifacts:
   movielens:  # ml-1m.zip + extracted files, filled by `loader --download`
+  # /data of the Airflow containers: raw/ (bootstrap_data's ml-1m.zip) and runs/{run_id}/
+  # (Parquet and models handed from task to task). Separate from `movielens`, which belongs
+  # to the API image's user (uid 10001); Airflow runs as uid 50000.
+  airflow-data:
+  airflow-logs:  # task logs: written by the scheduler, read by the api-server for the UI
