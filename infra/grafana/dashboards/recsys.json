@@ -612,7 +612,9 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
+          "min": 0,
           "custom": {
+            "axisSoftMax": 0.1,
             "drawStyle": "line",
             "lineWidth": 2,
             "fillOpacity": 10,
