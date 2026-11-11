@@ -247,6 +247,9 @@ write_status() {
 
 main() {
   local detach="" allow_older=0 ref site script
+  # First thing, before any check: a detached child that dies in validation (a bad tag, no
+  # .env) must leave `done <code>` for the workflow, not `running` forever.
+  [ -z "${DEPLOY_STATUS_FILE:-}" ] || trap 'write_status $?' EXIT
   script=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
   while [ $# -gt 0 ]; do
     case $1 in
@@ -281,7 +284,6 @@ main() {
     return 0
   fi
 
-  [ -z "${DEPLOY_STATUS_FILE:-}" ] || trap 'write_status $?' EXIT
   trap '' PIPE
   trap 'on_signal TERM' TERM
   trap 'on_signal INT' INT

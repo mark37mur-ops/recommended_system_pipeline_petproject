@@ -40,6 +40,7 @@ SWAP_SIZE=${SWAP_SIZE:-2G}
 # Overridable for the tests only (tests/unit/test_bootstrap_ssh.py).
 ROOT_KEYS=${ROOT_KEYS:-/root/.ssh/authorized_keys}
 SSHD_DROPIN_DIR=${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}
+SSH_KEYGEN=${SSH_KEYGEN:-ssh-keygen}
 
 log() { printf 'bootstrap: %s\n' "$*" >&2; }
 
@@ -93,7 +94,7 @@ generate_env() {
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
-  apt-get install -y -q ca-certificates curl git gnupg openssl ufw unattended-upgrades
+  apt-get install -y -q ca-certificates curl git gnupg openssh-client openssl ufw unattended-upgrades
   # Install security updates automatically (Ubuntu's default policy: security pocket only).
   printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' \
     > /etc/apt/apt.conf.d/20auto-upgrades
@@ -151,28 +152,53 @@ setup_firewall() {
   ufw --force enable
 }
 
-# ADMIN_PUBKEY (optional): the owner's own key, added to root's authorized_keys once.
+# valid_pubkey <line>: ONE line that ssh-keygen accepts as a public key.
+valid_pubkey() {
+  local tmp ok=1
+  command -v "$SSH_KEYGEN" > /dev/null || return 1
+  case $1 in *$'
+'*) return 1 ;; esac
+  tmp=$(mktemp)
+  printf '%s
+' "$1" > "$tmp"
+  "$SSH_KEYGEN" -l -f "$tmp" > /dev/null 2>&1 || ok=0
+  rm -f "$tmp"
+  [ "$ok" = 1 ]
+}
+
+# ADMIN_PUBKEY (optional): the owner's own key, added to root's authorized_keys once. A key
+# ssh-keygen rejects is refused before anything changes: it would count as "an admin can get
+# in" and the next step would switch password login off.
 add_admin_key() {
   [ -n "${ADMIN_PUBKEY:-}" ] || return 0
+  valid_pubkey "$ADMIN_PUBKEY" ||
+    { log "ERROR: ADMIN_PUBKEY is not one valid public key line (checked with $SSH_KEYGEN -l)"; return 1; }
   [ -d "$(dirname "$ROOT_KEYS")" ] || install -d -m 700 "$(dirname "$ROOT_KEYS")"
   touch "$ROOT_KEYS"
   chmod 600 "$ROOT_KEYS"
-  grep -qxF "$ADMIN_PUBKEY" "$ROOT_KEYS" || printf '%s\n' "$ADMIN_PUBKEY" >> "$ROOT_KEYS"
+  grep -qxF "$ADMIN_PUBKEY" "$ROOT_KEYS" || printf '%s
+' "$ADMIN_PUBKEY" >> "$ROOT_KEYS"
 }
 
-# How many keys let a HUMAN in as root: lines of root's authorized_keys other than comments
-# and the CI key (DEPLOY_PUBKEY). The CI key does not count: its private half lives in GitHub
-# Secrets and `deploy` has no sudo, so with only that key nobody could get root back.
+# How many keys let a HUMAN in as root: lines of root's authorized_keys that ssh-keygen accepts
+# as a public key, other than the CI key (DEPLOY_PUBKEY). Comments, blanks and junk do not
+# count. The CI key does not count either: its private half lives in GitHub Secrets and
+# `deploy` has no sudo, so with only that key nobody could get root back. Without ssh-keygen
+# nothing can be validated: 0, i.e. password login stays on (fail safe).
 admin_key_count() {
-  local ci
-  [ -f "$ROOT_KEYS" ] || { echo 0; return 0; }
-  ci=$(printf '%s\n' "${DEPLOY_PUBKEY:-}" | awk '{ print $2 }')
-  awk -v ci="$ci" '
-    /^[[:space:]]*(#|$)/ { next }
-    ci != "" && index($0, ci) { next }
-    { n++ }
-    END { print n + 0 }
-  ' "$ROOT_KEYS"
+  local ci line n=0
+  if [ ! -f "$ROOT_KEYS" ] || ! command -v "$SSH_KEYGEN" > /dev/null; then
+    echo 0
+    return 0
+  fi
+  ci=$(printf '%s
+' "${DEPLOY_PUBKEY:-}" | awk '{ print $2 }')
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [ -n "$ci" ] && [[ $line == *"$ci"* ]] && continue
+    if valid_pubkey "$line"; then n=$((n + 1)); fi
+  done < "$ROOT_KEYS"
+  echo "$n"
 }
 
 harden_ssh() {

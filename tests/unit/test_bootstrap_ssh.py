@@ -4,16 +4,40 @@ key DEPLOY_PUBKEY does not count: `deploy` has no sudo), a configuration sshd re
 removed again before anything reloads, and the firewall allows SSH before it is switched on
 (s7-review I-3, Minor-5)."""
 
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 from shell_fakes import ShellHarness, find_bash, posix
 
 BASH = find_bash()
-pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash (Git's bash on Windows)")
+KEYGEN = shutil.which("ssh-keygen")
+pytestmark = [
+    pytest.mark.skipif(BASH is None, reason="needs bash (Git's bash on Windows)"),
+    pytest.mark.skipif(KEYGEN is None, reason="needs ssh-keygen (the script validates keys)"),
+]
 
-CI_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICIcIcIcIcIcIcIcIcIcIcIcIc github-actions"
-ADMIN_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdMiNaDmInAdMiNaDmInAdMiN owner@laptop"
+
+def make_key(comment: str) -> str:
+    """A real, throwaway ed25519 public key line (the script checks keys with ssh-keygen)."""
+    if KEYGEN is None:
+        return f"ssh-ed25519 unavailable {comment}"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "key"
+        subprocess.run(
+            [KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", comment, "-f", str(path)],
+            check=True,
+            capture_output=True,
+        )
+        return (Path(tmp) / "key.pub").read_text().strip()
+
+
+CI_KEY = make_key("github-actions")
+ADMIN_KEY = make_key("owner@laptop")
+# Looks like a key line, is not one: valid type, a blob that decodes to nothing useful.
+JUNK_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAdMiNaDmInAdMiNaDmInAdMiN owner@laptop"
 
 
 @pytest.fixture
@@ -117,3 +141,51 @@ def test_firewall_allows_ssh_before_it_is_enabled(shell, tmp_path):
     calls = [c.removeprefix("ufw ") for c in result.calls]
     assert calls.index("allow 22/tcp") < calls.index("--force enable")
     assert calls[-1] == "--force enable"
+
+
+def test_junk_lines_do_not_count_as_an_admin_key(shell, server, tmp_path):
+    lines = [CI_KEY, "this is not a key", JUNK_KEY, "ssh-rsa"]
+    server["keys"].write_text("\n".join(lines) + "\n", newline="\n")
+
+    result = harden(shell, server, tmp_path)
+
+    assert result.returncode == 0, result.output
+    assert not hardening(server).exists()
+    assert not [c for c in result.calls if c.startswith(("sshd", "systemctl"))]
+    assert "password login left ON" in result.output
+
+
+def test_a_valid_key_among_junk_still_counts(shell, server, tmp_path):
+    server["keys"].write_text(f"junk\n{ADMIN_KEY}\n{CI_KEY}\n", newline="\n")
+
+    result = harden(shell, server, tmp_path)
+
+    assert result.returncode == 0, result.output
+    assert hardening(server).exists()
+
+
+def test_without_ssh_keygen_no_key_counts_and_password_login_stays_on(shell, server, tmp_path):
+    server["keys"].write_text(ADMIN_KEY + "\n", newline="\n")
+
+    result = harden(shell, server, tmp_path, SSH_KEYGEN="/nonexistent/ssh-keygen")
+
+    assert result.returncode == 0, result.output
+    assert not hardening(server).exists()
+    assert "password login left ON" in result.output
+
+
+@pytest.mark.parametrize("bad", ["not a key", JUNK_KEY, ADMIN_KEY + "\n" + ADMIN_KEY])
+def test_malformed_admin_pubkey_is_rejected_before_any_change(shell, server, tmp_path, bad):
+    server["keys"].write_text(CI_KEY + "\n", newline="\n")
+
+    result = shell.call(
+        "bootstrap-server.sh",
+        "add_admin_key",
+        cwd=tmp_path,
+        ROOT_KEYS=posix(server["keys"]),
+        ADMIN_PUBKEY=bad,
+    )
+
+    assert result.returncode != 0
+    assert "ADMIN_PUBKEY" in result.output
+    assert server["keys"].read_text() == CI_KEY + "\n"

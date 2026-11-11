@@ -328,6 +328,26 @@ def test_detached_deploy_that_is_killed_rolls_back_and_says_so(app, shell):
     assert env_value(app, "IMAGE_TAG") == OLD
 
 
+@pytest.mark.parametrize(
+    ("args", "remove_env"),
+    [(["sha-1; reboot"], False), ([NEW], True)],
+    ids=["invalid-tag", "no-env-file"],
+)
+def test_detached_child_failing_early_writes_done_not_running(app, shell, args, remove_env):
+    """The detached child dies in validation, before the lock and the rollback machinery:
+    the status file the workflow polls must still say `done <code>`, not stay `running`."""
+    if remove_env:
+        (app / ".env").unlink()
+    status = app / ".deploy" / "81-1.status"
+    status.parent.mkdir()
+    status.write_text("running\n")
+
+    result = shell.run("deploy.sh", *args, cwd=app, DEPLOY_STATUS_FILE=posix(status), **FAST)
+
+    assert result.returncode == 1, result.output
+    assert status.read_text() == "done 1\n"
+
+
 def test_detach_refuses_a_reused_id_and_bad_input(app, shell):
     first = shell.run("deploy.sh", "--detach", "79-1", NEW, cwd=app, **FAST)
     assert first.returncode == 0, first.output
