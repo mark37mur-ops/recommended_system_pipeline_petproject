@@ -37,7 +37,8 @@ SIGNATURE = ModelSignature(
     ),
     params=ParamSchema([ParamSpec("k", "long", 10)]),
 )
-_REQUIREMENTS = ("implicit", "lightgbm", "mlflow", "numpy", "pandas", "pyarrow", "scipy")
+# mlflow-skinny (the client the API image installs) is also installed by the full `mlflow`.
+_REQUIREMENTS = ("implicit", "lightgbm", "mlflow-skinny", "numpy", "pandas", "pyarrow", "scipy")
 
 
 class RecommenderPyfunc(mlflow.pyfunc.PythonModel):

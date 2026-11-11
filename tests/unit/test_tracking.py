@@ -1,6 +1,9 @@
 """MLflow layer against a throw-away SQLite store in tmp (no server, nothing under ./mlruns)."""
 
 import dataclasses
+import inspect
+from importlib.metadata import version as package_version
+from pathlib import Path
 
 import mlflow
 import pandas as pd
@@ -9,13 +12,14 @@ from mlflow import MlflowClient
 from synthetic import make_ratings, write_raw_dir
 
 from recsys.models.als import ALSConfig
-from recsys.models.pyfunc import log_recommender
+from recsys.models.pyfunc import log_recommender, pip_requirements
 from recsys.models.ranker import RankerConfig
 from recsys.models.two_stage import RECOMMENDATION_COLUMNS
-from recsys.pipelines.train import TrainConfig, main, run_training
+from recsys.pipelines.train import TrainConfig, main, parse_args, run_training
 from recsys.tracking import (
     CHAMPION_ALIAS,
     DEFAULT_TRACKING_URI,
+    champion_version,
     configure_mlflow,
     data_snapshot_hash,
     decide_promotion,
@@ -135,11 +139,11 @@ def test_sweep_runs_are_nested_children(first_run):
     assert run.config.als == best
 
 
-def test_first_version_becomes_champion_and_loads(tracking_uri, first_run, raw_dir):
+def test_first_version_becomes_champion_and_loads(tracking_uri, first_run, raw_dir, tmp_path):
     run, _ = first_run
     assert run.registration is not None
     assert run.registration.version == "1" and run.registration.promoted
-    champion = load_champion(tracking_uri, name="test-model")
+    champion = load_champion(tracking_uri, name="test-model", dst_dir=tmp_path)
     assert champion.version == "1" and champion.run_id == run.run_id
     users = [1, 2, 3]
     assert champion.recommender.recommend_known_users(
@@ -164,7 +168,12 @@ def _register_copy(run, metrics, snapshot, tmp_root):
     with mlflow.start_run(experiment_id=run.experiment_id) as new_run:
         info = log_recommender(run.result.recommender, tmp_root=tmp_root)
     return register_and_promote(
-        info.model_uri, new_run.info.run_id, metrics, snapshot, name="test-model"
+        info.model_uri,
+        new_run.info.run_id,
+        metrics,
+        snapshot,
+        name="test-model",
+        beats_popularity=True,
     )
 
 
@@ -226,7 +235,7 @@ def test_data_snapshot_hash_independent_of_dtype():
 
 
 def test_load_champion_resolves_alias_once_and_loads_that_exact_version(
-    tracking_uri, first_run, monkeypatch
+    tracking_uri, first_run, monkeypatch, tmp_path
 ):
     """Race guard: the alias may move between two lookups, so it must be read exactly once and
     the weights loaded by the resolved version number."""
@@ -238,18 +247,22 @@ def test_load_champion_resolves_alias_once_and_loads_that_exact_version(
         return original(self, name, alias)
 
     loaded = []
-    original_load = mlflow.pyfunc.load_model
+    original_download = mlflow.artifacts.download_artifacts
 
-    def recording(uri, *args, **kwargs):
-        loaded.append(uri)
-        return original_load(uri, *args, **kwargs)
+    def recording(artifact_uri=None, *args, **kwargs):
+        loaded.append(artifact_uri)
+        return original_download(artifact_uri, *args, **kwargs)
 
     monkeypatch.setattr(MlflowClient, "get_model_version_by_alias", counting)
-    monkeypatch.setattr(mlflow.pyfunc, "load_model", recording)
-    champion = load_champion(tracking_uri, name="test-model")
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", recording)
+    champion = load_champion(tracking_uri, name="test-model", dst_dir=tmp_path)
     assert calls == [("test-model", CHAMPION_ALIAS)]
-    assert loaded == [f"models:/test-model/{champion.version}"]
-    assert champion.model_uri == loaded[0]
+    expected = MlflowClient(tracking_uri).get_model_version_download_uri(
+        "test-model", champion.version
+    )
+    assert not expected.startswith("models:/")  # the local store gives the files' location
+    assert loaded == [expected]
+    assert champion.model_uri == f"models:/test-model/{champion.version}"
 
 
 @pytest.mark.parametrize("dtype", ["int8", "int32", "int64"])
@@ -291,9 +304,11 @@ def ranker_run(tracking_uri, raw_dir, tmp_path_factory):
         patch.undo()
 
 
-def test_ranker_variant_logs_loads_and_predicts_with_int_ratings(tracking_uri, ranker_run):
+def test_ranker_variant_logs_loads_and_predicts_with_int_ratings(
+    tracking_uri, ranker_run, tmp_path
+):
     assert ranker_run.result.variant == "als_ranker"
-    champion = load_champion(tracking_uri, name="ranker-model")
+    champion = load_champion(tracking_uri, name="ranker-model", dst_dir=tmp_path)
     assert champion.recommender.variant == "als_ranker"
     assert champion.recommender.ranker is not None
     data = MlflowClient().get_run(ranker_run.run_id).data
@@ -354,3 +369,62 @@ def test_git_sha_env_override(monkeypatch):
     assert git_sha() == "abc1234"
     monkeypatch.delenv("GIT_SHA")
     assert git_sha() != "abc1234"
+
+
+def test_load_champion_does_not_use_or_change_global_tracking_uri(
+    tracking_uri, first_run, tmp_path
+):
+    """The API passes its URI explicitly; a process-wide MLflow URI must neither be needed nor
+    be overwritten (the global points at an unreachable server here)."""
+    previous = mlflow.get_tracking_uri()
+    unreachable = "http://127.0.0.1:9"
+    mlflow.set_tracking_uri(unreachable)
+    try:
+        champion = load_champion(tracking_uri, name="test-model", dst_dir=tmp_path)
+        assert mlflow.get_tracking_uri() == unreachable
+    finally:
+        mlflow.set_tracking_uri(previous)
+    assert champion.recommender.recommend_new_user([(3, 5), (6, 4)], k=3)
+
+
+def test_load_champion_downloads_into_dst_dir_and_cleans_up(
+    tracking_uri, first_run, tmp_path, monkeypatch
+):
+    destinations = []
+    original_download = mlflow.artifacts.download_artifacts
+
+    def recording(*args, **kwargs):
+        destinations.append(Path(kwargs["dst_path"]))
+        return original_download(*args, **kwargs)
+
+    monkeypatch.setattr(mlflow.artifacts, "download_artifacts", recording)
+    dst = tmp_path / "models"
+    champion = load_champion(tracking_uri, name="test-model", dst_dir=dst)
+    assert len(destinations) == 1 and destinations[0].parent == dst
+    assert not destinations[0].exists()  # weights are in memory, the download is removed
+    assert list(dst.iterdir()) == []
+    assert len(champion.recommender.recommend_new_user([(3, 5), (6, 4)], k=5)) == 5
+
+
+def test_champion_version_resolves_alias_or_none(tracking_uri, first_run):
+    assert champion_version(tracking_uri, name="test-model") == "1"
+    assert champion_version(tracking_uri, name="no-such-model") is None
+
+
+def test_register_and_promote_requires_explicit_beats_popularity():
+    param = inspect.signature(register_and_promote).parameters["beats_popularity"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is inspect.Parameter.empty
+
+
+def test_pip_requirements_pin_mlflow_skinny():
+    requirements = pip_requirements()
+    assert f"mlflow-skinny=={package_version('mlflow-skinny')}" in requirements
+    assert not any(r.startswith("mlflow==") for r in requirements)
+
+
+def test_cli_tmp_dir_option():
+    assert parse_args(["--data-dir", "d"]).tmp_dir == Path("mlruns") / "tmp"
+    assert parse_args(["--data-dir", "d", "--tmp-dir", "/tmp/recsys"]).tmp_dir == Path(
+        "/tmp/recsys"
+    )

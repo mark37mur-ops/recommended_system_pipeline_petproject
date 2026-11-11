@@ -7,7 +7,9 @@ registry uses aliases (`champion`), never the deprecated stages.
 
 import hashlib
 import os
+import shutil
 import subprocess
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,9 @@ MODEL_NAME = "movielens-recommender"
 CHAMPION_ALIAS = "champion"
 NDCG_TOLERANCE = 0.005
 MAX_COVERAGE_DROP = 0.10
+# Where load_champion downloads model artifacts unless told otherwise (never the system temp
+# dir, which is on the small C: drive locally). The download is removed once loaded.
+DEFAULT_MODEL_DIR = Path("mlruns") / "tmp" / "champion"
 
 
 def resolve_tracking_uri(uri: str | None = None) -> str:
@@ -141,7 +146,8 @@ def register_and_promote(
     tags: Mapping[str, str] | None = None,
     name: str = MODEL_NAME,
     k: int = 10,
-    beats_popularity: bool = True,
+    *,
+    beats_popularity: bool,
 ) -> RegistrationOutcome:
     """Register `model_uri` as a new version of `name` and move `champion` if it deserves it.
 
@@ -205,17 +211,61 @@ class ChampionModel:
     model_uri: str
 
 
-def load_champion(tracking_uri: str | None = None, name: str = MODEL_NAME) -> ChampionModel:
+def _client(tracking_uri: str | None) -> tuple[MlflowClient, str]:
+    uri = resolve_tracking_uri(tracking_uri)
+    return MlflowClient(tracking_uri=uri, registry_uri=uri), uri
+
+
+def _storage_location(client: MlflowClient, name: str, version: str) -> str:
+    """Where the version's files live (file://, mlflow-artifacts:/ ...), resolved with `client`.
+
+    Downloading `models:/name/version` directly would let MLflow resolve the registry through
+    the process-wide registry URI (mlflow 3.18 `ModelsArtifactRepository._get_model_uri_infos`
+    ignores the URIs passed to `download_artifacts`), so the indirection is done here."""
+    location = client.get_model_version_download_uri(name, version)
+    if location.startswith("models:/"):  # MLflow 3: the version points at a logged model
+        model_id = location.removeprefix("models:/").split("/", 1)[0]
+        location = client.get_logged_model(model_id).artifact_location
+    return location
+
+
+def champion_version(tracking_uri: str | None = None, name: str = MODEL_NAME) -> str | None:
+    """Version number the `champion` alias points to, or None if there is no such alias/model.
+
+    Cheap (one registry call): lets the API skip a reload when the champion did not change."""
+    client, _ = _client(tracking_uri)
+    champion = _current_champion(client, name)
+    return None if champion is None else str(champion.version)
+
+
+def load_champion(
+    tracking_uri: str | None = None, name: str = MODEL_NAME, dst_dir: Path | None = None
+) -> ChampionModel:
     """Load the `champion` version of the registered model (what the API serves).
 
     The alias is resolved exactly once and the weights are loaded by that version number, so a
     promotion happening meanwhile cannot make `version` and the loaded model disagree.
+    Artifacts are downloaded into a fresh sub-directory of `dst_dir` (default
+    DEFAULT_MODEL_DIR), read into memory and the sub-directory is deleted again. The tracking
+    and registry URIs are passed explicitly: process-wide MLflow state is neither read nor
+    changed, so this is safe to call from a background thread of a running service.
     """
-    mlflow.set_tracking_uri(resolve_tracking_uri(tracking_uri))
-    model_version = MlflowClient().get_model_version_by_alias(name, CHAMPION_ALIAS)
+    client, uri = _client(tracking_uri)
+    model_version = client.get_model_version_by_alias(name, CHAMPION_ALIAS)
     model_uri = f"models:/{name}/{model_version.version}"
-    pyfunc_model = mlflow.pyfunc.load_model(model_uri)
-    recommender = pyfunc_model.unwrap_python_model().recommender
+    root = Path(dst_dir) if dst_dir is not None else DEFAULT_MODEL_DIR
+    target = root / f"v{model_version.version}-{uuid.uuid4().hex[:8]}"
+    try:
+        local = mlflow.artifacts.download_artifacts(
+            artifact_uri=_storage_location(client, name, str(model_version.version)),
+            dst_path=str(target),
+            tracking_uri=uri,
+            registry_uri=uri,
+        )
+        pyfunc_model = mlflow.pyfunc.load_model(local)
+        recommender = pyfunc_model.unwrap_python_model().recommender
+    finally:
+        shutil.rmtree(target, ignore_errors=True)
     return ChampionModel(
         recommender=recommender,
         version=str(model_version.version),
