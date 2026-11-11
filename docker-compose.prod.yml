@@ -1,0 +1,240 @@
+# Production override (spec 6.1-6.4): what the server does differently from a laptop.
+# Used ON TOP of docker-compose.yml, never alone:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+# (infra/scripts/deploy.sh does exactly this on every deploy; see it for the rollback.)
+# What changes and why:
+#   - images come from GHCR, tagged by git sha, instead of being built: the server builds
+#     nothing (8 GB RAM, a build would compete with the running stack), CI builds once and the
+#     same bytes that passed the tests are what runs; IMAGE_TAG in .env picks the version;
+#   - Caddy is added as the single entry point on 80/443 (HTTPS, path filtering);
+#   - no other port is reachable from outside (see "Ports" below);
+#   - memory limits (one container cannot take the 8 GB server down), log rotation (stdout
+#     logs must not fill the disk), real client IPs behind the proxy, Grafana under /grafana/.
+#
+# How Compose merges an override (it is not a plain replacement):
+#   - mappings (environment, deploy, logging) are merged key by key;
+#   - `ports` lists are APPENDED, not replaced, so removing a published port needs the YAML
+#     tag `!reset []`; `build: !reset null` removes the build section (Compose >= 2.24).
+#   Check the merged result: docker compose -f docker-compose.yml -f docker-compose.prod.yml config
+
+# Every container: Docker's json-file driver keeps logs forever by default; 3 x 10 MB per
+# container is enough to debug the last incident (`docker compose logs`) and bounded on disk.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Same images as CI pushes (.github/workflows/ci.yml, job `publish`). IMAGE_PREFIX is
+# ghcr.io/<owner>/<repo> in lower case (GHCR rejects upper case); IMAGE_TAG is sha-<7 chars>
+# (written by deploy.sh) or `latest`.
+# Every service on one of our images also says `build: !reset null` itself: a `!reset` inside
+# a merged anchor (`<<: [...]`) is silently dropped by Compose, the build section would stay.
+x-api-image: &api-image
+  image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}-api:${IMAGE_TAG:?set IMAGE_TAG in .env}
+
+x-airflow-image: &airflow-image
+  image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}-airflow:${IMAGE_TAG:?set IMAGE_TAG in .env}
+
+# Memory limits (spec 6.1, measured in stage 5: whole stack ~2.2 GB idle, ~3.6 GB peak during
+# retrain_daily). Each limit is ~1.5-2x the measured peak of that container: a hard ceiling
+# against a leak, not a reservation, so the sum may exceed what is used at any one time.
+# A container over its limit is killed by the kernel (OOM) and restarted by its restart policy.
+
+services:
+  # ----- Ports ----------------------------------------------------------------------------
+  # Docker publishes ports with its own iptables rules, which bypass ufw: a port published on
+  # 0.0.0.0 is open to the internet whatever ufw says. So in production:
+  #   - Caddy is the only service on 0.0.0.0 (80, 443);
+  #   - Postgres, Redis and the API publish nothing (`!reset []`): the API is reached through
+  #     Caddy, the databases through `docker compose exec`;
+  #   - MLflow, Airflow, Grafana and Prometheus keep their 127.0.0.1 ports from
+  #     docker-compose.yml: loopback is not reachable from outside, and it is the end point of
+  #     the SSH tunnel the admin uses (spec 6.2: ssh -L 8080:localhost:8080 server).
+  postgres:
+    <<: *logging
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 1g  # measured peak 222 MB; headroom for pg_dump and the training extract
+
+  db-init:
+    <<: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+  redis:
+    <<: *logging
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          memory: 192m  # maxmemory 128mb (docker-compose.yml) + the server itself
+
+  mlflow:
+    <<: *logging
+    image: ${IMAGE_PREFIX:?set IMAGE_PREFIX in .env}-mlflow:${IMAGE_TAG:?set IMAGE_TAG in .env}
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 768m  # measured peak 474 MB
+
+  api:
+    <<: [*api-image, *logging]
+    build: !reset null
+    ports: !reset []
+    environment:
+      # Served over HTTPS only: the visitor cookie gets the Secure flag.
+      COOKIE_SECURE: "true"
+      # uvicorn (--proxy-headers) believes X-Forwarded-For only from these addresses. The edge
+      # network holds just Caddy, the API and Grafana, so this is "trust Caddy". Without it
+      # every visitor would share Caddy's address and one rate-limit bucket; with "*" anyone
+      # could fake an IP by sending the header.
+      FORWARDED_ALLOW_IPS: ${EDGE_SUBNET:-10.203.17.0/24}
+    networks:
+      - default
+      - edge
+    deploy:
+      resources:
+        limits:
+          memory: 1g  # measured peak 380 MB; the champion is loaded next to the serving one
+
+  airflow-init:
+    <<: [*airflow-image, *logging]
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  airflow-apiserver:
+    <<: [*airflow-image, *logging]
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 768m  # measured 266 MB
+
+  # LocalExecutor: the training tasks run inside this container, so it gets the big limit.
+  airflow-scheduler:
+    <<: [*airflow-image, *logging]
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 2560m  # measured peak 1426 MB during retrain_daily (ALS + LightGBM + Evidently)
+
+  airflow-dag-processor:
+    <<: [*airflow-image, *logging]
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 512m  # measured 223 MB
+
+  prometheus:
+    <<: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 512m  # measured 94 MB; grows with the number of series, 7 days retention
+
+  grafana-init:
+    <<: [*api-image, *logging]
+    build: !reset null
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  grafana:
+    <<: *logging
+    environment:
+      # Grafana lives under https://<site>/grafana/ behind Caddy. SERVE_FROM_SUB_PATH makes it
+      # answer under /grafana/ itself (Caddy passes the prefix through), so the same UI also
+      # works through the SSH tunnel at http://localhost:3000/grafana/. ROOT_URL is used for
+      # absolute links (alert messages, the public dashboard link).
+      GF_SERVER_ROOT_URL: https://${SITE_ADDRESS:?set SITE_ADDRESS in .env}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    healthcheck:
+      # With the sub-path, the health endpoint moved under /grafana/ as well.
+      test: !override ["CMD", "wget", "-qO-", "http://localhost:3000/grafana/api/health"]
+    networks:
+      - default
+      - edge
+    deploy:
+      resources:
+        limits:
+          # Anonymous memory ~250 MB, plus ~250-400 MB page cache of its own mapped binaries,
+          # which the limit counts too. At 512m the local e2e showed the cgroup at its limit
+          # all the time (memory.events max=24781, no OOM): the kernel kept evicting
+          # Grafana's code pages and reading them back. 768m leaves room for both.
+          memory: 768m
+
+  grafana-publish:
+    <<: [*api-image, *logging]
+    build: !reset null
+    environment:
+      GRAFANA_URL: http://grafana:3000/grafana
+      # Base of the printed public link: https://<site>/grafana/public-dashboards/<token>
+      GRAFANA_PUBLIC_URL: https://${SITE_ADDRESS:?set SITE_ADDRESS in .env}/grafana
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  loader:
+    <<: [*api-image, *logging]
+    build: !reset null
+
+  trainer:
+    <<: [*api-image, *logging]
+    build: !reset null
+
+  # ----- the single entry point -------------------------------------------------------------
+  caddy:
+    <<: *logging
+    # Pinned: the edge proxy changes only when we decide (stage-6-7 plan, Decision 3).
+    image: caddy:2.11.9-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"        # ACME HTTP-01 challenge + redirect to HTTPS
+      - "443:443"      # HTTPS
+      - "443:443/udp"  # HTTP/3 (QUIC)
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and the ACME account. On a volume so a recreated container does not
+      # request new certificates every deploy (Let's Encrypt rate-limits duplicates).
+      - caddy-data:/data
+      - caddy-config:/config
+    # Only the edge network: Caddy can reach the API and Grafana, not Postgres, Redis, MLflow.
+    networks:
+      - edge
+    # No depends_on: Caddy resolves upstreams per request and answers 502 while one is down;
+    # it must keep serving (and renewing certificates) whatever state the API is in.
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+networks:
+  # Caddy + API + Grafana. A fixed subnet so the API can trust "X-Forwarded-For from this
+  # subnet" (FORWARDED_ALLOW_IPS above); a fixed address of the Caddy container would be
+  # fragile (another container may take it first). Change EDGE_SUBNET if it collides with a
+  # network of the VPS provider.
+  edge:
+    ipam:
+      config:
+        - subnet: ${EDGE_SUBNET:-10.203.17.0/24}
+
+volumes:
+  caddy-data:    # certificates, ACME account (keep it: re-issuing is rate-limited)
+  caddy-config:  # Caddy's autosaved config

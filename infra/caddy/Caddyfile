@@ -1,0 +1,91 @@
+# Caddy: the only thing the internet talks to (spec 6.2). It terminates HTTPS, gets and renews
+# the certificate itself and decides which paths of which container are public at all.
+#
+#   /                 -> api:8000           the recommender page and its JSON API
+#   /metrics*, /admin* -> 404                internal: Prometheus scrapes /metrics and Airflow calls
+#                                            /admin/reload-model inside the compose network
+#   /grafana/...      -> grafana:3000       ONLY the public read-only dashboard and its assets
+#   /grafana/<other>  -> 404                login, data source API, admin UI: SSH tunnel only
+#
+# SITE_ADDRESS comes from the server's .env (docker-compose.prod.yml passes it in):
+#   1.2.3.4.sslip.io  a real public name -> Let's Encrypt certificate (HTTP-01 on port 80,
+#                     TLS-ALPN on 443; both ports must be reachable from the internet)
+#   localhost         local testing -> certificate from Caddy's own local CA (curl -k)
+# Check the file: docker run --rm -e SITE_ADDRESS=example.sslip.io -v "$PWD/infra/caddy:/etc/caddy:ro"
+#   caddy:2.11.9-alpine caddy validate --config /etc/caddy/Caddyfile
+
+{
+	# The admin API (config reloads) listens on localhost:2019 inside the container only:
+	# reload with `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
+	#
+	# Caddy would try to add its local CA to the system trust store for `localhost`; inside a
+	# container there is no store worth touching, so skip it (no effect for a public name).
+	skip_install_trust
+}
+
+# Headers for every response. Why each one:
+(security_headers) {
+	header {
+		# Browsers remember for a year to use HTTPS only (no plain-HTTP first request to hijack).
+		# No includeSubDomains/preload: the free sslip.io name is not ours to promise that for.
+		Strict-Transport-Security "max-age=31536000"
+		# Do not guess a content type from the body (a JSON answer must not run as a script).
+		X-Content-Type-Options "nosniff"
+		# Nobody may frame our pages (clickjacking); Grafana sends the same by default.
+		X-Frame-Options "DENY"
+		# Other sites see only our origin in Referer, never the path (public dashboard token).
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# The page needs none of these browser features.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		# Do not advertise the server software. (No Content-Security-Policy: Grafana's frontend
+		# needs inline scripts and eval, a strict policy would break it, a loose one adds little.)
+		-Server
+	}
+}
+
+{$SITE_ADDRESS} {
+	import security_headers
+
+	# Compress text responses (HTML, JSON, Grafana's JS bundles); zstd for clients that know it.
+	encode zstd gzip
+
+	# The API takes small JSON bodies only; refuse big uploads at the edge (413).
+	request_body {
+		max_size 1MB
+	}
+
+	# `handle` blocks are mutually exclusive: the first matching one wins. With named matchers
+	# Caddy keeps them in the order written here, so the order below IS the routing table.
+	# Path matching is case-insensitive and runs on the cleaned path (no `..` tricks).
+
+	# 1. Internal endpoints of the API. 404 rather than 403: from outside nothing is there.
+	@internal path /metrics* /admin*
+	handle @internal {
+		respond 404
+	}
+
+	# 2. Grafana's public dashboard (spec 5.4): the page, the panel queries it sends
+	# (/api/public/dashboards/<token>/panels/<id>/query run only the saved panel queries, never
+	# arbitrary SQL) and static files. Grafana serves itself under /grafana/
+	# (GF_SERVER_SERVE_FROM_SUB_PATH), so the prefix is passed through, not stripped.
+	@grafana_public path /grafana/public-dashboards/* /grafana/api/public/* /grafana/public/*
+	handle @grafana_public {
+		reverse_proxy grafana:3000
+	}
+
+	# 3. Anything else under /grafana (login, /api/datasources, /api/ds/query, the admin UI):
+	# not reachable from the internet even with the admin password. Admins use the SSH tunnel
+	# (ssh -L 3000:localhost:3000 server, then http://localhost:3000/grafana/).
+	@grafana path /grafana /grafana/*
+	handle @grafana {
+		respond 404
+	}
+
+	# 4. Everything else is the application. Caddy sets X-Forwarded-For to the real client
+	# address (it does not trust an X-Forwarded-For sent by the client: no trusted_proxies),
+	# and the API trusts that header only from the edge network (FORWARDED_ALLOW_IPS), so
+	# per-IP rate limits see visitors, not Caddy.
+	handle {
+		reverse_proxy api:8000
+	}
+}
