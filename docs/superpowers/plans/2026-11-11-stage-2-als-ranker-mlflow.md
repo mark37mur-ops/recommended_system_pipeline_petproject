@@ -4,7 +4,7 @@
 
 **Goal:** Двухэтапная модель (кандидаты ALS + LightGBM `lambdarank`), честно сравнённая с popularity на одном и том же тестовом сплите по NDCG@10 / Recall@10 / Coverage. Все запуски (включая маленький sweep гиперпараметров ALS) пишутся в MLflow, лучшая модель регистрируется как `movielens-recommender` с alias `champion`. Интерфейсы fold-in и загрузки чемпиона готовы для API этапа 3.
 
-**Architecture:** Пакет `recsys` получает: `evaluation.py` (единый протокол оценки для всех моделей), `models/als.py` (генератор кандидатов + fold-in), `features.py` (чистые функции признаков, общие для обучения и сервиса), `models/ranker.py` (обёртка `LGBMRanker`), `models/two_stage.py` (сборка ALS + признаки + ранжировщик, сохранение в папку-бандл), `models/pyfunc.py` (MLflow pyfunc поверх бандла), `tracking.py` (MLflow: URI, эксперимент, теги, регистрация, alias, загрузка чемпиона), `pipelines/train.py` (CLI обучения). Ядро обучения (`train_and_evaluate`) не знает про MLflow, MLflow-слой тонкий и тестируется на временной sqlite-базе.
+**Architecture:** Пакет `recsys` получает: `evaluation.py` (единый протокол оценки для всех моделей), `models/als.py` (генератор кандидатов + fold-in), `features.py` (чистые функции признаков, общие для обучения и сервиса), `models/ranker.py` (обёртка `LGBMRanker`), `models/two_stage.py` (сборка ALS + признаки + ранжировщик, сохранение в папку-бандл), `models/pyfunc.py` + `models/pyfunc_entry.py` (MLflow pyfunc поверх бандла, models-from-code), `tracking.py` (MLflow: URI, эксперимент, теги, регистрация, alias, загрузка чемпиона), `pipelines/train.py` (CLI обучения). Ядро обучения (`train_and_evaluate`) не знает про MLflow, MLflow-слой тонкий и тестируется на временной sqlite-базе.
 
 **Tech Stack:** Python 3.12, uv, pandas, numpy, scipy (CSR-матрицы), `implicit` 0.7.3 (CPU ALS), `lightgbm` 4.7.0 (`LGBMRanker`), `threadpoolctl` (BLAS в один поток для воспроизводимости), `mlflow` 3.18 (tracking + Model Registry, локальный backend `sqlite:///mlruns/mlflow.db`), pytest, ruff.
 
@@ -55,6 +55,11 @@ split: [ als_train | ranker_train (5) | test (5) ]
 10. **Pyfunc без `code_paths`.** Модель ссылается на установленный пакет `recsys` (в образе API он есть). Копия кода внутри модели могла бы затенить установленный `recsys` и дать train/serve skew в `features.py`. `pip_requirements` задаются явно, чтобы MLflow не запускал медленный вывод зависимостей.
 11. **Вход pyfunc — оценки.** `predict(DataFrame[user_id, movie_id, rating], params={"k": 10})` делает fold-in по переданным оценкам и возвращает `DataFrame[user_id, rank, movie_id, score]`. Это единый путь для любого пользователя (API всегда может достать оценки из Postgres). Для известных пользователей есть отдельный метод с сохранёнными факторами (им пользуется оценка).
 
+12. **Профессия — числовой код, не categorical** (решено при реализации). На валидационной выборке стадии A (отложенные 10% пользователей ranker_train) 21-уровневый categorical не дал прироста NDCG@10 (0.1597 против 0.1612 у числового кода) и забирал ~10% всего gain — признак переобучения на маленьких группах. Отложенная выборка увеличена до 20% пользователей, patience early stopping до 50, чтобы остановка была менее шумной.
+13. **Pyfunc «models from code»** (`pyfunc_entry.py` вызывает `mlflow.models.set_model`), а не pickle объекта: так рекомендует MLflow 3, в артефактах нет cloudpickle. `input_example` при логировании заодно прогоняет бандл через predict (smoke-тест).
+14. **Дефолты ALS из sweep:** `factors=64, regularization=0.05, alpha=0.5, rating_weight=linear` (лучший валидационный NDCG@10 = 0.0700 среди `linear`; `binary` дал 0.0702 — разница в пределах шума, выбран соответствующий spec `linear`). Сетка: factors {32, 64, 128} × regularization {0.05, 5} × alpha {0.25, 0.5, 1, 2} + `binary`.
+15. **Честность протокола.** Конфиг ранжировщика (п. 12) выбирался по валидации, но test-таблица до и после этой правки была посмотрена (два взгляда на test). Сетка ALS и выбор её победителя на test не смотрели.
+
 ## Review Focus
 
 1. **Утечка через ALS для ранжировщика.** ALS, дающий кандидатов и скор для обучения ранжировщика, обязан быть обучен только на `als_train`; признаки стадии A тоже считаются только по `als_train`. Тест в Task 7 проверяет число оценок, на которых обучены ALS_A и ALS_B, и неизменность метрик при порче `test` у sweep.
@@ -69,14 +74,15 @@ split: [ als_train | ranker_train (5) | test (5) ]
 
 ```
 src/recsys/
-├── evaluation.py            # EvalContext, build_history, единый протокол, таблица сравнения
+├── evaluation.py            # EvalContext, build_history, make_test_context / make_validation_context
 ├── features.py              # GENRES, FEATURE_COLUMNS, movie/user/pair features (train == serve)
 ├── tracking.py              # MLflow: URI, эксперимент, теги, регистрация, alias, load_champion
 ├── models/
 │   ├── als.py               # ALSConfig, confidence_weights, ALSCandidateGenerator (fit, candidates, fold-in, save/load)
 │   ├── ranker.py            # RankerConfig, label_candidates, build_training_frame, LambdaRanker
 │   ├── two_stage.py         # TwoStageRecommender (ALS + признаки + ranker), save/load бандла
-│   └── pyfunc.py            # RecommenderPyfunc (mlflow.pyfunc.PythonModel)
+│   ├── pyfunc.py            # RecommenderPyfunc (mlflow.pyfunc.PythonModel), log_recommender
+│   └── pyfunc_entry.py      # models-from-code entry point (set_model)
 └── pipelines/
     ├── baseline.py          # (изменён) использует evaluation.py, проверка k >= 1
     └── train.py             # train_and_evaluate, validate_als, sweep, CLI
@@ -135,14 +141,15 @@ class EvalContext:
 
 def build_history(split: Split) -> tuple[pd.DataFrame, dict[int, set[int]]]   # перенесён из baseline
 def make_context(history, target, n_items, k=10) -> EvalContext
-def test_context(split, n_items, k=10) -> EvalContext        # history = als_train ∪ ranker_train, target = test
-def validation_context(split, n_items, k=10) -> EvalContext  # history = als_train, target = ranker_train
+def make_test_context(split, n_items, k=10) -> EvalContext        # history = als_train ∪ ranker_train, target = test
+def make_validation_context(split, n_items, k=10) -> EvalContext  # history = als_train, target = ranker_train
+def seen_by_user(ratings) -> dict[int, set[int]]
 RecommendFn = Callable[[EvalContext], Mapping[int, Sequence[int]]]
 def evaluate_recommendations(recs, ctx) -> dict[str, float]  # ProtocolViolation, если в топ-k есть seen
 def compare_models(models: Mapping[str, RecommendFn], ctx) -> dict[str, dict[str, float]]
 def format_comparison(results, k=10) -> str                  # таблица: model | ndcg_at_10 | recall_at_10 | coverage
 ```
-`baseline.build_history` остаётся доступным (реэкспорт), `recommend_for_test_users`/`run_baseline` идут через `test_context` — golden-значения бейзлайна не меняются.
+`baseline.build_history` остаётся доступным (реэкспорт), `recommend_for_test_users`/`run_baseline` идут через `make_test_context` — golden-значения бейзлайна не меняются.
 
 - [ ] **Step 1: Тесты** (`test_evaluation.py`):
   `test_test_context_history_is_als_plus_ranker_and_target_is_test`, `test_validation_context_uses_als_train_and_ranker_train`, `test_context_users_sorted_and_seen_from_history`, `test_evaluate_recommendations_rejects_seen_item` (`ProtocolViolation`), `test_seen_beyond_k_is_not_a_violation`, `test_compare_models_passes_same_context_to_every_model` (шпион записывает `id(ctx)`), `test_format_comparison_lists_models_in_order`.
@@ -162,7 +169,7 @@ def confidence_weights(ratings: ArrayLike, scheme: str = "linear") -> np.ndarray
 
 @dataclass(frozen=True)
 class ALSConfig:
-    factors: int = 64; regularization: float = 0.05; alpha: float = 1.0; iterations: int = 15
+    factors: int = 64; regularization: float = 0.05; alpha: float = 0.5; iterations: int = 15
     rating_weight: str = "linear"; random_state: int = 42; num_threads: int = 0
 
 CANDIDATE_COLUMNS = ["user_id", "movie_id", "als_score", "als_rank"]   # als_rank с 1
@@ -196,7 +203,8 @@ GENRE_COLUMNS = [f"genre_{slug}" ...]
 FEATURE_COLUMNS: list[str]               # als_score, als_rank, movie_n_ratings, movie_mean_rating, movie_year,
                                          # *GENRE_COLUMNS, user_n_ratings, user_mean_rating, user_age, user_gender,
                                          # user_occupation, genre_affinity_mean, genre_affinity_max
-CATEGORICAL_FEATURES = ["user_occupation"]
+SHARE_COLUMNS, DEMOGRAPHIC_COLUMNS                # share_<genre>; user_age, user_gender, user_occupation
+def movie_genre_matrix(movies: pd.DataFrame) -> pd.DataFrame   # index movie_id, GENRE_COLUMNS (0/1)
 def movie_features(ratings: pd.DataFrame, movies: pd.DataFrame) -> pd.DataFrame   # index movie_id: n, mean, year, genre_*
 def user_features(ratings: pd.DataFrame, movie_genres: pd.DataFrame,
                   users: pd.DataFrame | None = None) -> pd.DataFrame              # index user_id: n, mean, age, gender, occupation, share_*
@@ -221,8 +229,8 @@ def build_feature_frame(candidates: pd.DataFrame, movie_feats: pd.DataFrame,
 @dataclass(frozen=True)
 class RankerConfig:
     n_estimators: int = 300; learning_rate: float = 0.05; num_leaves: int = 31
-    min_child_samples: int = 50; colsample_bytree: float = 0.8; early_stopping_rounds: int = 30
-    valid_fraction: float = 0.1; demographics_dropout: float = 0.1; random_state: int = 42; n_jobs: int = 0
+    min_child_samples: int = 50; colsample_bytree: float = 0.8; early_stopping_rounds: int = 50
+    valid_fraction: float = 0.2; demographics_dropout: float = 0.1; random_state: int = 42; n_jobs: int = 0
 
 def label_candidates(candidates: pd.DataFrame, targets: pd.DataFrame) -> np.ndarray     # int8: 1, если пара в targets
 def build_training_frame(candidates, targets, movie_feats, user_feats) -> pd.DataFrame  # фичи + label, группы подряд, без групп без позитивов
@@ -230,7 +238,8 @@ class LambdaRanker:
     def __init__(self, config: RankerConfig = RankerConfig()) -> None
     def fit(self, frame: pd.DataFrame) -> Self      # объектив lambdarank, eval_at=[10], early stopping на отложенных пользователях
     def predict(self, features: pd.DataFrame) -> np.ndarray
-    best_iteration: int; def feature_importance(self) -> dict[str, float]   # gain
+    best_iteration: int; valid_ndcg: float | None   # NDCG@10 на отложенных пользователях
+    def feature_importance(self) -> dict[str, float]   # gain
     def save(self, path: Path) -> None; @classmethod def load(cls, path: Path) -> Self
 ```
 
@@ -252,6 +261,7 @@ class TwoStageRecommender:
     variant: str                                     # "als_ranker" | "als_only"
     def without_ranker(self) -> "TwoStageRecommender"
     def recommend_known_users(self, user_ids: Sequence[int], k: int = 10) -> dict[int, list[int]]
+    def user_features_for(self, ratings: pd.DataFrame, profiles: pd.DataFrame | None = None) -> pd.DataFrame
     def recommend_for_ratings(self, ratings: pd.DataFrame, k: int = 10,
                               profiles: pd.DataFrame | None = None) -> pd.DataFrame   # user_id, rank, movie_id, score
     def recommend_new_user(self, ratings: Sequence[tuple[int, int]], k: int = 10,
@@ -297,7 +307,7 @@ def train_and_evaluate(ratings, movies, users, config=TrainConfig()) -> TrainRes
 ### Task 8: MLflow: трекинг, pyfunc, реестр, alias, CLI
 
 **Files:**
-- Create: `src/recsys/tracking.py`, `src/recsys/models/pyfunc.py`; Modify: `src/recsys/pipelines/train.py` (CLI `main`)
+- Create: `src/recsys/tracking.py`, `src/recsys/models/pyfunc.py`, `src/recsys/models/pyfunc_entry.py`; Modify: `src/recsys/pipelines/train.py` (CLI `main`)
 - Test: `tests/unit/test_tracking.py`
 
 **Interfaces:**
@@ -309,12 +319,15 @@ def configure_mlflow(uri: str | None = None, experiment: str = EXPERIMENT_NAME) 
 def git_sha() -> str; def data_snapshot_hash(ratings: pd.DataFrame) -> str   # не зависит от порядка строк
 def decide_promotion(challenger: Mapping[str, float], champion: Mapping[str, float] | None,
                      ndcg_tolerance: float = 0.005, max_coverage_drop: float = 0.10) -> tuple[bool, str]
-def log_train_run(result: TrainResult, config: TrainConfig, tags: Mapping[str, str], run_name: str) -> str   # run_id
-def register_and_promote(run_id: str, model_uri: str, result: TrainResult, snapshot: str) -> RegistrationOutcome
-def load_champion(tracking_uri: str | None = None) -> TwoStageRecommender
-class RecommenderPyfunc(mlflow.pyfunc.PythonModel)   # predict(ratings DataFrame, params={"k"}) → DataFrame
+def register_and_promote(model_uri: str, run_id: str, metrics: Mapping[str, float], snapshot: str,
+                         tags: Mapping[str, str] | None = None, name: str = MODEL_NAME, k: int = 10) -> RegistrationOutcome
+def load_champion(tracking_uri: str | None = None, name: str = MODEL_NAME) -> ChampionModel   # recommender, version, run_id, model_uri
+# models/pyfunc.py: class RecommenderPyfunc(mlflow.pyfunc.PythonModel)  # predict(ratings DataFrame, params={"k"}) → DataFrame
+#                   def log_recommender(recommender, name='model', tmp_root=None) -> ModelInfo
+# pipelines/train.py: run_training(raw_dir, config, tracking_uri, experiment, model_name, sweep_grid, register, tmp_root, echo) -> TrainingRun
+#                     DEFAULT_SWEEP_GRID, select_best_als, main(argv=None)
 ```
-CLI: `uv run python -m recsys.pipelines.train --data-dir data/raw/ml-1m [--sweep] [--tracking-uri URI] [--no-register] [--factors ... --regularization ... --alpha ... --iterations ... --rating-weight ...]`. Печатает таблицу сравнения, run id, версию модели, решение по alias.
+CLI: `uv run python -m recsys.pipelines.train --data-dir data/raw/ml-1m [--sweep] [--tracking-uri URI] [--experiment NAME] [--model-name NAME] [--no-register] [--k 10] [--n-candidates 100] [--factors ... --regularization ... --alpha ... --iterations ... --rating-weight ...]`. Печатает таблицу сравнения, run id, версию модели, решение по alias.
 
 В MLflow (spec 4.3): params (ALS, LightGBM, сиды, n_candidates, k); metrics `{model}_{metric}` для трёх моделей + `ndcg_at_10/recall_at_10/coverage` выбранного варианта + диагностика; tags `git_sha`, `data_snapshot`, `n_users`, `n_ratings`, `web_share`, `variant`, `run_type`; artifacts: `comparison.md`, `comparison.json`, `movie_features.parquet`, `feature_importance.json`, pyfunc `model`. Sweep-запуски — дочерние runs с `run_type=sweep` и метриками `val_*`.
 
