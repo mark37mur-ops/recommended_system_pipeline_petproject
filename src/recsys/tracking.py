@@ -211,6 +211,51 @@ def register_and_promote(
     )
 
 
+# ----- building blocks of the retraining DAG (stage 4) --------------------------------------
+
+
+class ChampionMoved(RuntimeError):
+    """The `champion` alias changed between evaluation and promotion."""
+
+
+def register_version(
+    model_uri: str, run_id: str, tags: Mapping[str, str], name: str = MODEL_NAME
+) -> str:
+    """Register `model_uri` as a new version of `name`, at most once per MLflow run.
+
+    The version number is remembered in the run's `registered_version` tag: a retry of the
+    task after a successful registration returns the same version instead of adding one."""
+    client = MlflowClient()
+    known = client.get_run(run_id).data.tags.get("registered_version")
+    if known is not None:
+        return known
+    version = str(mlflow.register_model(model_uri, name).version)
+    for key, value in tags.items():
+        client.set_model_version_tag(name, version, key, value)
+    client.set_tag(run_id, "registered_version", version)
+    return version
+
+
+def set_champion(name: str, version: str, expected_previous: str | None) -> str | None:
+    """Point `champion` at `version` unless someone else moved it since it was evaluated.
+
+    `expected_previous` is the champion version the decision was based on (None = there was
+    none). Idempotent: if the alias already points at `version`, nothing happens. Returns the
+    version the alias pointed to before."""
+    client = MlflowClient()
+    current = _current_champion(client, name)
+    current_version = None if current is None else str(current.version)
+    if current_version == str(version):
+        return expected_previous
+    if current_version != expected_previous:
+        raise ChampionMoved(
+            f"champion of {name} moved from v{expected_previous} to v{current_version} after "
+            f"evaluation; re-run the evaluation instead of overwriting it"
+        )
+    client.set_registered_model_alias(name, CHAMPION_ALIAS, str(version))
+    return current_version
+
+
 @dataclass(frozen=True)
 class ChampionModel:
     recommender: TwoStageRecommender
