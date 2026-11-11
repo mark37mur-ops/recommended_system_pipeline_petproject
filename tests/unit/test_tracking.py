@@ -428,3 +428,25 @@ def test_cli_tmp_dir_option():
     assert parse_args(["--data-dir", "d", "--tmp-dir", "/tmp/recsys"]).tmp_dir == Path(
         "/tmp/recsys"
     )
+
+
+def test_registry_errors_are_not_mistaken_for_a_missing_champion(tracking_uri, monkeypatch):
+    """Only "not found" means "no champion"; an unreachable registry must raise, otherwise the
+    API reports a misleading reason and register_and_promote would promote without comparing."""
+    from mlflow.exceptions import MlflowException as Error
+
+    def broken(self, name, alias):
+        raise Error("API request to http://mlflow:5000 failed", error_code="INTERNAL_ERROR")
+
+    monkeypatch.setattr(MlflowClient, "get_model_version_by_alias", broken)
+    with pytest.raises(Error, match="API request"):
+        champion_version(tracking_uri, name="test-model")
+    with pytest.raises(Error, match="API request"):
+        register_and_promote(
+            "models:/m-1",
+            "run",
+            {"ndcg_at_10": 1.0, "coverage": 1.0},
+            "snap",
+            name="test-model",
+            beats_popularity=True,
+        )

@@ -131,11 +131,19 @@ class RegistrationOutcome:
     champion_metrics: dict[str, float] | None
 
 
+# Error codes the registry uses for "no such model" / "no such alias". Anything else (server
+# unreachable, internal error) must propagate: treating it as "no champion" would make
+# register_and_promote promote without comparing.
+_NOT_FOUND_CODES = {"RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"}
+
+
 def _current_champion(client: MlflowClient, name: str):
     try:
         return client.get_model_version_by_alias(name, CHAMPION_ALIAS)
-    except MlflowException:
-        return None
+    except MlflowException as exc:
+        if exc.error_code in _NOT_FOUND_CODES:
+            return None
+        raise
 
 
 def register_and_promote(
