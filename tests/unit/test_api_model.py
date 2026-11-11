@@ -1,4 +1,5 @@
 import threading
+import time
 
 from api_fakes import FakeChampion, StubRecommender
 
@@ -101,11 +102,42 @@ def test_concurrent_reload_reports_busy():
     assert holder.current.version == "3"
 
 
-def test_reader_keeps_a_consistent_reference_during_swap():
-    registry = Registry("1")
-    holder = ModelHolder(registry.load, registry.probe)
+def test_readers_never_see_a_half_swapped_model():
+    """Readers hammer `current` while reloads swap versions: every snapshot must be a
+    complete model whose recommender belongs to its version (the swap is one assignment),
+    and a reader keeps working with the object it read even after the next swap."""
+    registry = Registry("0")
+    built = {}
+
+    def load():
+        time.sleep(0.002)  # a load takes time: readers run while it is in progress
+        champion = registry.load()
+        built[champion.version] = champion.recommender
+        return champion
+
+    holder = ModelHolder(load, registry.probe)
     holder.reload()
-    snapshot = holder.current
-    registry.version = "2"
-    holder.reload()
-    assert snapshot.version == "1" and holder.current.version == "2"
+    stop, problems, seen = threading.Event(), [], set()
+
+    def reader():
+        while not stop.is_set():
+            model = holder.current
+            if model is None or built.get(model.version) is not model.recommender:
+                problems.append(model)
+                return
+            seen.add(model.version)
+            if model.recommender.recommend_new_user([(1, 5)], k=3) != [60, 59, 58]:
+                problems.append(model)
+                return
+
+    readers = [threading.Thread(target=reader) for _ in range(4)]
+    for t in readers:
+        t.start()
+    for version in range(1, 30):
+        registry.version = str(version)
+        assert holder.reload().status == "loaded"
+    stop.set()
+    for t in readers:
+        t.join(5)
+    assert problems == [] and holder.current.version == "29"
+    assert len(seen) > 1  # readers really ran across several swaps

@@ -155,15 +155,22 @@ def test_pin_blas_threads_skips_per_call_limits(monkeypatch):
         calls.append(args)
         return real(*args, **kwargs)
 
+    before = {p["filepath"]: p["num_threads"] for p in threadpool_info()}
     monkeypatch.setattr(als_module, "_BLAS_PINNED", False)
+    monkeypatch.setattr(als_module, "_BLAS_LIMITER", None)
     monkeypatch.setattr(als_module, "threadpool_limits", spy)
     model.candidates_for_ratings(visitor, n=5)
     assert calls, "without pinning every call limits BLAS itself"
 
     calls.clear()
     als_module.pin_blas_threads()
-    model.candidates_for_ratings(visitor, n=5)
-    model.candidates([1, 2], n=5)
-    assert calls == []
-    blas = [p for p in threadpool_info() if p["user_api"] == "blas"]
-    assert all(p["num_threads"] == 1 for p in blas)
+    try:
+        model.candidates_for_ratings(visitor, n=5)
+        model.candidates([1, 2], n=5)
+        assert calls == []
+        blas = [p for p in threadpool_info() if p["user_api"] == "blas"]
+        assert all(p["num_threads"] == 1 for p in blas)
+    finally:
+        # The pin is process-wide: undo it so later tests see the thread pools they had.
+        als_module._BLAS_LIMITER.restore_original_limits()
+    assert {p["filepath"]: p["num_threads"] for p in threadpool_info()} == before
