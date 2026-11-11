@@ -45,6 +45,11 @@ class ALSConfig:
     num_threads: int = 0
 
 
+def _last_rating_per_pair(ratings: pd.DataFrame) -> pd.DataFrame:
+    """One row per (user, movie), keeping the last one: a CSR matrix would sum duplicates."""
+    return ratings.drop_duplicates(["user_id", "movie_id"], keep="last")
+
+
 def _empty_candidates() -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -68,7 +73,11 @@ class ALSCandidateGenerator:
 
     # ----- fitting -------------------------------------------------------------------------
     def fit(self, ratings: pd.DataFrame) -> Self:
-        """Fit on a ratings frame with columns user_id, movie_id, rating."""
+        """Fit on a ratings frame with columns user_id, movie_id, rating.
+
+        Duplicate (user, movie) rows are collapsed to the last one.
+        """
+        ratings = _last_rating_per_pair(ratings)
         self._user_ids = np.sort(ratings["user_id"].unique()).astype(np.int64)
         self._movie_ids = np.sort(ratings["movie_id"].unique()).astype(np.int64)
         rows = np.searchsorted(self._user_ids, ratings["user_id"].to_numpy())
@@ -138,8 +147,10 @@ class ALSCandidateGenerator:
         (`recalculate_user=True`), then return top-n movies not in those ratings.
 
         Works for any user id (new web visitors included). Movies unknown to the model are
-        ignored for the factors; users with no known movies get no candidates.
+        ignored for the factors; users with no known movies get no candidates. Duplicate
+        (user, movie) rows are collapsed to the last one.
         """
+        ratings = _last_rating_per_pair(ratings)
         users = np.sort(ratings["user_id"].unique()).astype(np.int64)
         col = pd.Index(self._movie_ids).get_indexer(ratings["movie_id"].to_numpy())
         known = col >= 0

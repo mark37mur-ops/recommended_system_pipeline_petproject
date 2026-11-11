@@ -115,3 +115,25 @@ def test_save_load_roundtrip_same_candidates(als, tmp_path, ratings):
     pd.testing.assert_frame_equal(
         loaded.candidates_for_ratings(new), als.candidates_for_ratings(new)
     )
+
+
+def _with_stale_duplicates(frame: pd.DataFrame) -> pd.DataFrame:
+    """Every row preceded by an older, different rating of the same (user, movie)."""
+    stale = frame.copy()
+    stale["rating"] = (6 - stale["rating"]).astype(frame["rating"].dtype)
+    return pd.concat([stale, frame], ignore_index=True)
+
+
+def test_fold_in_duplicate_rows_keep_last_instead_of_summing(als, ratings):
+    own = ratings[ratings["user_id"] == 3][["user_id", "movie_id", "rating"]]
+    clean = als.candidates_for_ratings(own, n=10)
+    duplicated = als.candidates_for_ratings(_with_stale_duplicates(own), n=10)
+    pd.testing.assert_frame_equal(duplicated, clean)
+
+
+def test_fit_duplicate_rows_keep_last_instead_of_summing(ratings):
+    cols = ["user_id", "movie_id", "rating"]
+    clean = ALSCandidateGenerator(CONFIG).fit(ratings[cols])
+    duplicated = ALSCandidateGenerator(CONFIG).fit(_with_stale_duplicates(ratings[cols]))
+    assert duplicated._user_items is not None and clean._user_items is not None
+    assert (duplicated._user_items != clean._user_items).nnz == 0
