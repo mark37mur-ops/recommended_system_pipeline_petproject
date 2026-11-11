@@ -1,7 +1,7 @@
 # MovieLens Recommender Service — дизайн
 
 **Дата:** 2026-11-11
-**Статус:** черновик. Секции 1–4 согласованы, секция 5 на согласовании, секция 6 ещё не обсуждалась.
+**Статус:** черновик. Секции 1–5 согласованы, секция 6 на согласовании.
 
 ## 0. Цель и рамки
 
@@ -28,13 +28,14 @@
 
 | Компонент | Ответственность | Связи |
 |---|---|---|
-| Postgres | Единственный источник правды. Отдельные БД: `app` (movies, users, ratings), `airflow` (метаданные), `mlflow` (backend store) | все через SQL |
+| Postgres | Единственный источник правды. Отдельные БД: `app` (movies, users, ratings, recommendation_impressions, drift_metrics), `airflow` (метаданные), `mlflow` (backend store) | все через SQL |
 | Airflow | Запускает пайплайны по расписанию, ретраи, история запусков | читает `app`, пишет в MLflow, вызывает API |
 | MLflow | Трекинг экспериментов + Model Registry. Текущая боевая модель помечена alias `champion` | Airflow пишет, API читает |
 | FastAPI | API рекомендаций и оценок, отдаёт веб-страницу | MLflow (загрузка модели), Postgres, Redis |
 | Redis | Кэш рекомендаций и счётчики rate limiting | только FastAPI |
 | Prometheus + Grafana | Сбор метрик сервиса с `/metrics` и дашборды | опрашивают API |
 | Evidently | Библиотека внутри задачи Airflow, HTML-отчёт о дрифте данных | часть DAG |
+| Caddy | Reverse proxy: единственная точка входа снаружи, автоматический HTTPS | проксирует API и публичный дашборд Grafana |
 
 **Ключевые решения:**
 - Одна СУБД Postgres вместо Postgres + DuckDB: живые оценки и датасет лежат в одном месте.
@@ -157,7 +158,7 @@ extract_ratings → validate_data → drift_report → split
 - **Model Registry:** модель `movielens-recommender` (MLflow pyfunc, внутри ALS + ranker + признаки), версии, alias `champion`. Используются aliases, а не устаревшие stages.
 - Артефакты хранятся на диске сервера MLflow (`--serve-artifacts`). Клиенты загружают их по HTTP, общие тома не нужны.
 
-## 5. Мониторинг — на согласовании
+## 5. Мониторинг
 
 Три уровня: **сервис жив и быстр?** → **рекомендации полезны?** → **данные не уплыли?**
 
@@ -200,4 +201,68 @@ API отдаёт на `/metrics`:
 ### 5.6. Логи
 Структурированные JSON-логи в stdout, их собирает Docker. Централизованный сбор логов (Loki) — в v2.
 
-## 6. Инфраструктура, CI/CD, тестирование, этапы — ещё не обсуждали
+## 6. Инфраструктура, CI/CD, тестирование, этапы — на согласовании
+
+### 6.1. Сервер
+- Один VPS: 4 vCPU, 8 ГБ RAM, ~80 ГБ диск, Ubuntu LTS. Провайдер выбирается на этапе 6 по цене и способу оплаты.
+- Оценка памяти: Airflow ~2–2,5 ГБ, Postgres ~0,5, API ~0,5, MLflow ~0,3, Prometheus + Grafana ~0,5, Redis и Caddy < 0,2, пик обучения ~1 ГБ. Итого ~5–5,5 ГБ из 8.
+- **Локально:** Docker Desktop на WSL2. Диск Docker переносится на D: (на C: ~12 ГБ свободно), лимит памяти WSL — 6 ГБ через `.wslconfig`.
+
+### 6.2. Сеть и безопасность
+- Снаружи открыты только порты 22 (SSH), 80 и 443. Firewall `ufw`, вход по SSH только по ключу.
+- **Caddy** — единственная точка входа. Сам получает и продлевает HTTPS-сертификаты Let's Encrypt. Публично: `/` (приложение) и `/grafana/` (read-only дашборд).
+- Домен: на старте бесплатное имя вида `<ip>.sslip.io`, свой домен — по желанию.
+- **Airflow, MLflow, Prometheus и админка Grafana наружу не публикуются**: их порты привязаны к `127.0.0.1`, доступ только через SSH-туннель (`ssh -L 8080:localhost:8080 server`). Своей авторизации у MLflow по умолчанию нет, поэтому публиковать его нельзя.
+- Секреты лежат в `.env` на сервере, в git есть только `.env.example`. Для CI ключи хранятся в GitHub Secrets.
+- Бэкап: ночной `pg_dump` БД `app` (веб-оценки — единственные невосстановимые данные), хранится 7 дней. Бэкап на том же сервере — компромисс, вынос во внешнее хранилище — v2.
+
+### 6.3. Структура репозитория
+```
+movielens-recsys/
+├── src/recsys/              # Python-пакет: вся ML-логика
+│   ├── data/                #   загрузка, валидация, split
+│   ├── models/              #   popularity, als, ranker, pyfunc-обёртка
+│   ├── features.py          #   признаки (общие для обучения и API)
+│   ├── metrics.py           #   NDCG, Recall, Coverage
+│   └── drift.py             #   отчёты Evidently
+├── services/api/            # FastAPI: роуты, шаблоны, статика
+├── airflow/dags/            # тонкие DAG-файлы
+├── docker/                  # Dockerfile'ы: api, airflow
+├── infra/                   # Caddyfile, prometheus.yml, provisioning Grafana, скрипты бэкапа
+├── notebooks/               # EDA и эксперименты
+├── tests/{unit,integration}/
+├── docker-compose.yml       # всё окружение (локально)
+├── docker-compose.prod.yml  # отличия для сервера (Caddy, лимиты, без открытых портов)
+├── pyproject.toml + uv.lock
+├── .env.example
+└── .github/workflows/{ci.yml,deploy.yml}
+```
+Зависимости управляются через **uv**: lock-файл фиксирует точные версии, установка воспроизводима. Python 3.12.
+
+### 6.4. CI/CD (GitHub Actions)
+- **CI** (`ci.yml`, каждый push и PR): `ruff check` + `ruff format --check` → `pytest` (unit + integration с Postgres и Redis как service-контейнерами) → пробная сборка Docker-образов.
+- **CD** (`deploy.yml`, push в `main` после зелёного CI): сборка образов `api` и `airflow` с тегом `git sha` → push в GitHub Container Registry → SSH на сервер → `docker compose pull && up -d` → smoke-тест `GET /ready`. Если тест упал, откат на предыдущий тег.
+- **Код и модель выкатываются раздельно.** CD выкатывает код, модели приходят через MLflow Registry по решению DAG. Новая версия кода не меняет модель, новая модель не требует передеплоя.
+
+### 6.5. Тестирование
+| Уровень | Что проверяем |
+|---|---|
+| Unit | `metrics.py` сверяется с вручную посчитанными значениями (TDD); `split` без утечки (тестовые оценки каждого пользователя позже обучающих); признаки; логика холодного старта; правило `decide_promotion` |
+| Integration | API через `TestClient` с настоящими Postgres и Redis: оценка → рекомендации, деградация при недоступном Redis, rate limiting |
+| Pipeline | Все DAG импортируются без ошибок; end-to-end прогон обучения на маленьком синтетическом датасете (~50 пользователей) |
+| Smoke | После деплоя: `/ready` = 200, `/recommendations` возвращает 10 фильмов |
+
+### 6.6. Этапы
+Каждый этап заканчивается работающим, показываемым результатом. На каждый этап пишется свой план.
+
+| # | Этап | Результат «можно показать» |
+|---|---|---|
+| 0 | Окружение: Docker Desktop (диск на D:), uv, скелет репозитория, GitHub-репозиторий | `docker run hello-world`, пустой проект на GitHub |
+| 1 | Данные и базовая линия: загрузка ML-1M, EDA, split, метрики (TDD), popularity; **CI** с ruff + pytest | Первые числа NDCG@10, зелёная галочка CI |
+| 2 | Модели: ALS + ранжировщик, эксперименты в MLflow (Postgres + MLflow в compose) | Таблица сравнения трёх моделей в MLflow UI |
+| 3 | Сервис локально: FastAPI, страница, fold-in, холодный старт, Postgres, Redis | Оцениваешь фильмы в браузере, получаешь рекомендации |
+| 4 | Airflow: `bootstrap_data`, `retrain_daily`, валидация, promotion, reload | Система переобучается сама, видно в Airflow UI |
+| 5 | Мониторинг: Prometheus, Grafana, логи показов, Evidently, алерты в Telegram | Дашборд и тестовый алерт в Telegram |
+| 6 | Облако: VPS, Caddy + HTTPS, firewall, ручной деплой, бэкапы | **Публичная ссылка** |
+| 7 | CD: автодеплой с откатом | Push в `main` автоматически выкатывается |
+| 8 | Полировка: README со схемой, скриншотами, метриками и разделом «решения и компромиссы» | Готовый проект для резюме |
