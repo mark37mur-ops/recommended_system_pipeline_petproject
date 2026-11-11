@@ -10,8 +10,13 @@ class DataValidationError(Exception):
 
 
 def validate_ratings(
-    ratings: pd.DataFrame, previous_count: int | None = None, max_drop: float = 0.05
+    ratings: pd.DataFrame,
+    previous_count: int | None = None,
+    max_drop: float = 0.05,
+    previous_web_count: int | None = None,
 ) -> None:
+    """`previous_web_count`: web ratings in the previous run. Losing all of them is an error
+    on its own (they are ~0.2% of the data, the drop rule cannot see it), needs `source`."""
     problems: list[str] = []
 
     null_counts = ratings.isna().sum()
@@ -38,6 +43,10 @@ def validate_ratings(
         problems.append(
             f"row count dropped from {previous_count} to {len(ratings)} (more than {max_drop:.0%})"
         )
+
+    if previous_web_count and "source" in ratings.columns:
+        if not (ratings["source"] == "web").any():
+            problems.append(f"web ratings dropped from {previous_web_count} to 0")
 
     if problems:
         raise DataValidationError(problems)

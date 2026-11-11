@@ -5,12 +5,11 @@ from pathlib import Path
 from pydantic import SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# One secrets policy for the API and the Airflow containers (recsys.secrets_check).
+from recsys.secrets_check import MIN_SECRET_LENGTH, secret_problem
 from recsys.tracking import MODEL_NAME
 
-MIN_SECRET_LENGTH = 32
-# Template values (`.env.example`) and the usual "fill me in" markers; never real secrets.
-PLACEHOLDER_PREFIXES = ("change", "replace", "your-", "<")
-GENERATE_HINT = 'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+__all__ = ["MIN_SECRET_LENGTH", "Settings"]
 
 
 class Settings(BaseSettings):
@@ -52,13 +51,7 @@ class Settings(BaseSettings):
         anybody forge visitor cookies or call the admin endpoint."""
         if value is None:
             return None
-        raw = value.get_secret_value()
-        name = info.field_name.upper()
-        if raw.strip().lower().startswith(PLACEHOLDER_PREFIXES):
-            raise ValueError(f"{name} is a placeholder; generate one with: {GENERATE_HINT}")
-        if len(raw) < MIN_SECRET_LENGTH:
-            raise ValueError(
-                f"{name} must be at least {MIN_SECRET_LENGTH} characters; "
-                f"generate one with: {GENERATE_HINT}"
-            )
+        problem = secret_problem(info.field_name.upper(), value.get_secret_value())
+        if problem is not None:
+            raise ValueError(problem)
         return value

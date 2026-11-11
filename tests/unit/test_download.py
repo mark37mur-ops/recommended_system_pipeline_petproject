@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from recsys.data.download import download_ml1m
+from recsys.data.download import download_ml1m, extract_archive, fetch_archive
 
 
 @pytest.fixture
@@ -42,3 +42,12 @@ def test_download_raises_on_md5_mismatch(tmp_path, fake_zip):
     with pytest.raises(ValueError, match="MD5"):
         download_ml1m(tmp_path, url=fake_zip.uri, md5="0" * 32)
     assert not (tmp_path / "ml-1m.zip.part").exists()
+
+
+def test_fetch_archive_only_downloads(tmp_path, fake_zip):
+    archive = fetch_archive(tmp_path, url=fake_zip.uri, md5=fake_zip.md5)
+    assert archive == tmp_path / "ml-1m.zip"
+    assert not (tmp_path / "ml-1m").exists()
+    out = extract_archive(archive, tmp_path / "raw")
+    assert out == tmp_path / "raw" / "ml-1m"
+    assert (out / "ratings.dat").read_text() == "1::1::5::978300760\n"

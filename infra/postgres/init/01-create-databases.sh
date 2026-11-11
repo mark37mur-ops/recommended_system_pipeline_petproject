@@ -2,10 +2,12 @@
 # One Postgres instance, one database (and role) per component (spec 1):
 #   app    - movies, users, ratings (the API and the loader)
 #   mlflow - MLflow backend store
-#   airflow - stage 4 hook: created only when AIRFLOW_DB_PASSWORD is set
-# Runs automatically on the first start with an empty data volume. Idempotent, so it can be
-# re-run by hand on an existing volume (e.g. to add the airflow database in stage 4):
-#   docker compose exec postgres sh /docker-entrypoint-initdb.d/01-create-databases.sh
+#   airflow - Airflow metadata (stage 4). Compose always sets AIRFLOW_DB_PASSWORD (`:?`);
+#             the "skip when empty" branch below is only for running this script by hand.
+# Runs automatically on the first start with an empty data volume. Idempotent: the compose
+# job `db-init` runs it again against the running server on every `docker compose up`
+# (PGHOST=postgres), which adds databases missing on an existing volume and re-applies the
+# role passwords from .env.
 set -eu
 
 create_db() {

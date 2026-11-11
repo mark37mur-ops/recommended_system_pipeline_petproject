@@ -22,6 +22,7 @@ from recsys.data.split import Split, temporal_split
 from recsys.data.validate import validate_ratings
 from recsys.evaluation import (
     EvalContext,
+    build_history,
     compare_models,
     evaluate_recommendations,
     format_comparison,
@@ -79,18 +80,27 @@ def _candidate_lists(candidates: pd.DataFrame) -> dict[int, list[int]]:
     }
 
 
-def _foldin_ndcg(
+def foldin_metrics(
     recommender: TwoStageRecommender, ctx: EvalContext, users: pd.DataFrame | None
-) -> float:
-    """NDCG@k of the serving path: the test users' history is fed through fold-in (factors
-    recomputed from their ratings) instead of the fitted ALS factors. Reported next to the
-    main metrics so a drift between the two paths shows up in every run."""
+) -> dict[str, float]:
+    """Metrics of the serving path: the test users' history is fed through fold-in (factors
+    recomputed from their ratings) instead of fitted ALS factors. This is how the API serves
+    every web visitor, and how retrain_daily compares a challenger with the champion, whose
+    ALS never saw the new snapshot."""
     wanted = set(ctx.users)
     own = ctx.history[ctx.history["user_id"].isin(wanted)]
     profiles = None if users is None else users[users["user_id"].isin(wanted)]
     ranked = recommender.recommend_for_ratings(own, k=ctx.k, profiles=profiles)
     lists = TwoStageRecommender._as_dict(ranked, ctx.users)
-    return evaluate_recommendations(lists, ctx)[f"ndcg_at_{ctx.k}"]
+    return evaluate_recommendations(lists, ctx)
+
+
+def _foldin_ndcg(
+    recommender: TwoStageRecommender, ctx: EvalContext, users: pd.DataFrame | None
+) -> float:
+    """NDCG@k of the serving path, reported next to the main metrics so a drift between the
+    two paths shows up in every run."""
+    return foldin_metrics(recommender, ctx, users)[f"ndcg_at_{ctx.k}"]
 
 
 def validate_als(
@@ -142,18 +152,24 @@ def train_ranker(
     return ranker, diagnostics
 
 
-def train_and_evaluate(
-    ratings: pd.DataFrame,
+def fit_history_als(split: Split, config: TrainConfig) -> ALSCandidateGenerator:
+    """Stage B ALS: fit on the history (als_train + ranker_train); this is the served ALS."""
+    history, _ = build_history(split)
+    return ALSCandidateGenerator(config.als).fit(history)
+
+
+def evaluate_variants(
+    split: Split,
     movies: pd.DataFrame,
     users: pd.DataFrame | None,
-    config: TrainConfig = TrainConfig(),  # noqa: B008 (frozen dataclass)
+    ranker: LambdaRanker,
+    als: ALSCandidateGenerator,
+    config: TrainConfig,
+    diagnostics: dict[str, float] | None = None,
 ) -> TrainResult:
-    validate_ratings(ratings)
-    split = temporal_split(ratings)
-    ranker, diagnostics = train_ranker(split, movies, users, config)
-
+    """Stage B: popularity / ALS-only / ALS + ranker on the test split (one shared context),
+    pick the served variant (spec 2.5) and measure it through the fold-in serving path."""
     ctx = make_test_context(split, n_items=len(movies), k=config.k)
-    als = ALSCandidateGenerator(config.als).fit(ctx.history)
     genres = movie_genre_matrix(movies)
     full = TwoStageRecommender(
         als,
@@ -178,6 +194,7 @@ def train_and_evaluate(
     metrics = compare_models(models, ctx)
     variant = select_variant(metrics, k=config.k)
     served = full if variant == "als_ranker" else als_only
+    diagnostics = dict(diagnostics or {})
     diagnostics[f"{variant}_foldin_ndcg_at_{config.k}"] = _foldin_ndcg(served, ctx, users)
     diagnostics |= {
         "eval_als_n_ratings": float(als.n_train_ratings),
@@ -193,6 +210,21 @@ def train_and_evaluate(
         diagnostics=diagnostics,
         feature_importance=ranker.feature_importance(),
     )
+
+
+def train_and_evaluate(
+    ratings: pd.DataFrame,
+    movies: pd.DataFrame,
+    users: pd.DataFrame | None,
+    config: TrainConfig = TrainConfig(),  # noqa: B008 (frozen dataclass)
+) -> TrainResult:
+    """validate -> split -> ranker (stage A) -> history ALS -> evaluate (stage B), in memory.
+    `retrain_daily` runs the same steps as separate Airflow tasks (recsys.pipelines.retrain)."""
+    validate_ratings(ratings)
+    split = temporal_split(ratings)
+    ranker, diagnostics = train_ranker(split, movies, users, config)
+    als = fit_history_als(split, config)
+    return evaluate_variants(split, movies, users, ranker, als, config, diagnostics)
 
 
 # ----- MLflow orchestration and CLI ----------------------------------------------------------
@@ -270,7 +302,7 @@ def run_training(
         "data_snapshot": snapshot,
         "n_users": str(ratings["user_id"].nunique()),
         "n_ratings": str(len(ratings)),
-        # TODO: stays 0.0 until the ratings table gets a `source` column (web vs MovieLens).
+        # The raw MovieLens files hold no web ratings; retrain_daily computes the real share.
         "web_share": "0.0",
     }
     if tmp_root is not None:
@@ -327,7 +359,13 @@ def run_training(
             run.info.run_id,
             result.metrics[result.variant],
             snapshot,
-            tags={"variant": result.variant, "git_sha": data_tags["git_sha"]},
+            # Raw MovieLens files only (retrain_daily tags its versions the same way).
+            tags={
+                "variant": result.variant,
+                "git_sha": data_tags["git_sha"],
+                "include_web": "false",
+                "n_web_ratings": "0",
+            },
             name=model_name,
             k=k,
             beats_popularity=beats_popularity,

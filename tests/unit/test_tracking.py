@@ -94,6 +94,10 @@ CHAMPION = {"ndcg_at_10": 0.100, "coverage": 0.40}
         ({"ndcg_at_10": 0.0949, "coverage": 0.40}, CHAMPION, False),  # worse than tolerance
         ({"ndcg_at_10": 0.120, "coverage": 0.361}, CHAMPION, True),  # coverage -9.75%
         ({"ndcg_at_10": 0.120, "coverage": 0.359}, CHAMPION, False),  # coverage -10.25%
+        # exact boundaries pass (spec 4.2 "no more than"), despite 0.2 * 0.9 = 0.18000000000000002
+        ({"ndcg_at_10": 0.095, "coverage": 0.40}, CHAMPION, True),  # ndcg exactly -0.005
+        ({"ndcg_at_10": 0.12, "coverage": 0.18}, {"ndcg_at_10": 0.1, "coverage": 0.2}, True),
+        ({"ndcg_at_10": 0.12, "coverage": 0.36}, CHAMPION, True),  # coverage exactly -10%
     ],
 )
 def test_decide_promotion_rules(challenger, champion, promoted):
@@ -145,6 +149,9 @@ def test_first_version_becomes_champion_and_loads(tracking_uri, first_run, raw_d
     assert run.registration.version == "1" and run.registration.promoted
     champion = load_champion(tracking_uri, name="test-model", dst_dir=tmp_path)
     assert champion.version == "1" and champion.run_id == run.run_id
+    # the stage-3 trainer reads the raw MovieLens files: no web ratings, visible in the registry
+    tags = MlflowClient(tracking_uri=tracking_uri).get_model_version("test-model", "1").tags
+    assert tags["include_web"] == "false" and tags["n_web_ratings"] == "0"
     users = [1, 2, 3]
     assert champion.recommender.recommend_known_users(
         users
@@ -450,3 +457,44 @@ def test_registry_errors_are_not_mistaken_for_a_missing_champion(tracking_uri, m
             name="test-model",
             beats_popularity=True,
         )
+
+
+def test_register_version_after_a_crash_mid_tagging_reuses_the_version(
+    tracking_uri, first_run, tmp_path, monkeypatch
+):
+    """Stage 4 review I2: register_model succeeded, then the task died while tagging (MLflow
+    restart, OOM kill) before `registered_version` was written on the run. The retry must find
+    the version in the registry, not register a second one, and finish the tags."""
+    from recsys.tracking import register_version
+
+    run, _ = first_run
+    configure_mlflow(tracking_uri, "test-exp")
+    with mlflow.start_run(experiment_id=run.experiment_id) as new_run:
+        info = log_recommender(run.result.recommender, tmp_root=tmp_path)
+    run_id = new_run.info.run_id
+    tags = {"data_snapshot": "snap", "include_web": "true", "variant": "als_ranker"}
+
+    real_set_tag = MlflowClient.set_model_version_tag
+    calls = []
+
+    def crash_on_second_tag(self, name, version, key, value):
+        calls.append(key)
+        if len(calls) == 2:
+            raise mlflow.exceptions.MlflowException("connection reset (simulated)")
+        return real_set_tag(self, name, version, key, value)
+
+    monkeypatch.setattr(MlflowClient, "set_model_version_tag", crash_on_second_tag)
+    with pytest.raises(mlflow.exceptions.MlflowException, match="simulated"):
+        register_version(info.model_uri, run_id, tags, name="crash-model")
+    client = MlflowClient()
+    assert "registered_version" not in client.get_run(run_id).data.tags
+    assert len(client.search_model_versions("name='crash-model'")) == 1
+
+    version = register_version(info.model_uri, run_id, tags, name="crash-model")  # the retry
+    versions = client.search_model_versions("name='crash-model'")
+    assert [str(v.version) for v in versions] == [version] == ["1"]
+    assert tags.items() <= client.get_model_version("crash-model", version).tags.items()
+    assert client.get_run(run_id).data.tags["registered_version"] == version
+    # and once more after success: still the same single version
+    assert register_version(info.model_uri, run_id, tags, name="crash-model") == version
+    assert len(client.search_model_versions("name='crash-model'")) == 1
