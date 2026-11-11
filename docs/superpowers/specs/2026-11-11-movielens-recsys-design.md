@@ -176,7 +176,7 @@ API отдаёт на `/metrics`:
 | `model_info{version}` + `model_loaded_timestamp_seconds` | gauge | Какая версия в бою и насколько она старая. Устаревшая модель означает, что сломалось переобучение |
 
 ### 5.2. Онлайн-качество (Postgres → Grafana)
-- Таблица `recommendation_impressions(user_id, movie_id, position, model_version, shown_at)`: что и кому показали.
+- Таблица `recommendation_impressions(user_id, movie_id, position, model_version, shown_at)`: что и кому показали. Плюс колонка `path` (`full` / `cold_start` / `fallback`): онлайн-метрику модели считаем по `full` (stage-5 plan, Decision 9).
 - **Онлайн-метрика:** доля показанных рекомендаций, которые пользователь оценил в течение часа, и средняя оценка таких фильмов. Это «боевое» качество модели, в отличие от офлайн-NDCG.
 - Grafana читает эту таблицу напрямую через встроенный источник данных Postgres. Логи показов — фундамент для будущего A/B-теста (v2).
 
