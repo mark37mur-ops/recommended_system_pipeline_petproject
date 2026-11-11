@@ -12,6 +12,11 @@ def _top_unique(recommended: Sequence[int], k: int) -> list[int]:
 
 
 def ndcg_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> float:
+    """NDCG@k with binary relevance.
+
+    `recommended` is truncated to k first, then de-duplicated (first occurrence counts).
+    Returns 0.0 when `relevant` is empty.
+    """
     if not relevant:
         return 0.0
     dcg = sum(
@@ -26,6 +31,7 @@ def ndcg_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> fl
 
 
 def recall_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> float:
+    """Recall@k: hits among the top-k (truncated first, then de-duplicated) over |relevant|."""
     if not relevant:
         return 0.0
     hits = sum(1 for item in _top_unique(recommended, k) if item in relevant)
@@ -33,6 +39,7 @@ def recall_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> 
 
 
 def coverage(recommendations: Mapping[int, Sequence[int]], n_items: int) -> float:
+    """Share of the catalogue (n_items) that appears in any user's recommendations."""
     shown = {item for recs in recommendations.values() for item in recs}
     return len(shown) / n_items
 
@@ -43,6 +50,15 @@ def evaluate(
     n_items: int,
     k: int = 10,
 ) -> dict[str, float]:
+    """Mean NDCG@k and Recall@k over users present in `test`, plus catalogue coverage.
+
+    Conventions: relevance is binary, every item a user has in `test` is relevant; each
+    user's recommendations are truncated to k first and then de-duplicated; a user with no
+    recommendations scores 0. Coverage is the number of unique recommended items
+    (truncated to k) over users present in `test`, divided by n_items.
+
+    Keys are MLflow-compatible (no "@"): ndcg_at_{k}, recall_at_{k}, coverage.
+    """
     relevant_by_user = test.groupby("user_id")["movie_id"].agg(set).to_dict()
 
     ndcgs: list[float] = []
@@ -57,7 +73,7 @@ def evaluate(
         user: recommendations[user][:k] for user in relevant_by_user if user in recommendations
     }
     return {
-        f"ndcg@{k}": sum(ndcgs) / n_users if n_users else 0.0,
-        f"recall@{k}": sum(recalls) / n_users if n_users else 0.0,
+        f"ndcg_at_{k}": sum(ndcgs) / n_users if n_users else 0.0,
+        f"recall_at_{k}": sum(recalls) / n_users if n_users else 0.0,
         "coverage": coverage(shown_recs, n_items),
     }

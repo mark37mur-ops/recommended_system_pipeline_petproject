@@ -19,14 +19,14 @@
 - Всё на диске `D:` (`D:\movielens-recsys`, данные Docker в `D:\DockerData`). На `C:` свободно ~12 ГБ.
 - Split: per-user temporal, `n_ranker=5`, `n_test=5`, `min_ratings=15` (spec 2.1).
 - Метрики: K=10, главная NDCG@10; relevant = все фильмы пользователя в тесте (spec 2.5).
-- Детерминизм: при равных значениях порядок задаётся `movie_id` по возрастанию.
+- Детерминизм: tie-break в split = детерминированный хэш от (`user_id`, `movie_id`) (не `movie_id`: он коррелирует со временем добавления фильма); tie-break в popularity = `movie_id` по возрастанию (без изменений).
 - Шаги с пометкой **[ты]** выполняет пользователь: установка программ, аккаунты, публикация на GitHub. `git push` делается только по явному «да».
 
 ## Review Focus
 
 1. **Не-ASCII в названиях фильмов.** Файлы ML-1M в кодировке latin-1, есть названия вроде `Misérables, Les (1995)`. Загрузка не должна падать или ломать символы. Тест в Task 3.
 2. **Скобки внутри названия.** `City of Lost Children, The (Cité des enfants perdus, La) (1995)`: год берётся только из последней `(YYYY)` в конце, название без неё. Тест в Task 3.
-3. **Одинаковые timestamp у одного пользователя.** В ML-1M это очень частая ситуация. Split обязан быть детерминированным (tie-break по `movie_id`) и не менять результат между запусками. Тест в Task 5.
+3. **Одинаковые timestamp у одного пользователя.** В ML-1M это очень частая ситуация. Split обязан быть детерминированным (tie-break по хэшу от `user_id`, `movie_id`) и не менять результат между запусками. Тест в Task 5.
 4. **Короткий или дублированный список рекомендаций.** Меньше k фильмов или повтор одного id. NDCG ≤ 1, повтор не засчитывается дважды. Тест в Task 6.
 5. **Повторный запуск скачивания.** Если архив уже есть и MD5 совпадает, повторно не качаем. Если файл битый, качаем заново. Тест в Task 3.
 
@@ -297,10 +297,10 @@ movielens-recsys/
       assert len(parts) == len(df)
       assert not parts.duplicated(["user_id", "movie_id"]).any()
 
-  def test_ties_broken_by_movie_id_deterministically():
-      # у C все timestamp равны: в test попадают 5 наибольших movie_id
+  def test_ties_broken_by_hash_deterministically():
+      # у C все timestamp равны: порядок задаёт хэш (user_id, movie_id), не movie_id;
+      # результат не зависит от порядка строк на входе, три части не пересекаются
       s = temporal_split(df_c_ties)
-      assert sorted(s.test.movie_id) == [11, 12, 13, 14, 15]
       assert temporal_split(df_c_ties.sample(frac=1, random_state=1)).test.equals(s.test)
   ```
 - [ ] **Step 2: Запустить и увидеть падение.** Run: `uv run pytest tests/unit/test_split.py -v`. Expected: FAIL.
@@ -324,7 +324,7 @@ movielens-recsys/
   def coverage(recommendations: Mapping[int, Sequence[int]], n_items: int) -> float
   def evaluate(recommendations: Mapping[int, Sequence[int]], test: pd.DataFrame,
                n_items: int, k: int = 10) -> dict[str, float]
-      # -> {"ndcg@10": ..., "recall@10": ..., "coverage": ...}; ключи с фактическим k
+      # -> {"ndcg_at_10": ..., "recall_at_10": ..., "coverage": ...}; ключи с фактическим k
   ```
   Релевантность бинарная: релевантны все `movie_id` пользователя в `test`. Повторы в `recommended` засчитываются один раз (первое вхождение). Пустой `relevant` даёт `0.0`. `evaluate` усредняет по пользователям из `test`; если пользователя нет в `recommendations`, его метрики равны 0.
 
@@ -360,8 +360,8 @@ movielens-recsys/
   def test_evaluate_averages_and_missing_user_is_zero():
       test = pd.DataFrame({"user_id": [1, 2], "movie_id": [10, 20]})
       res = evaluate({1: [10]}, test, n_items=100, k=10)
-      assert res["ndcg@10"] == pytest.approx(0.5)      # (1.0 + 0.0) / 2
-      assert res["recall@10"] == pytest.approx(0.5)
+      assert res["ndcg_at_10"] == pytest.approx(0.5)      # (1.0 + 0.0) / 2
+      assert res["recall_at_10"] == pytest.approx(0.5)
       assert res["coverage"] == pytest.approx(0.01)
   ```
 - [ ] **Step 2: Запустить и увидеть падение.** Run: `uv run pytest tests/unit/test_metrics.py -v`. Expected: FAIL.
@@ -420,15 +420,15 @@ movielens-recsys/
 
 **Interfaces:**
 - Consumes: `load_ratings`, `load_movies` (Task 3), `validate_ratings` (Task 4), `temporal_split` (Task 5), `evaluate` (Task 6), `PopularityRecommender` (Task 7).
-- Produces: `run_baseline(raw_dir: Path, k: int = 10) -> dict[str, float]` и CLI `uv run python -m recsys.pipelines.baseline --data-dir data/raw/ml-1m [--k 10]`, который печатает метрики по строке: `ndcg@10: 0.xxxx`.
+- Produces: `run_baseline(raw_dir: Path, k: int = 10) -> dict[str, float]` и CLI `uv run python -m recsys.pipelines.baseline --data-dir data/raw/ml-1m [--k 10]`, который печатает метрики по строке: `ndcg_at_10: 0.xxxx`.
   Логика: загрузить → провалидировать → split → `fit` на `als_train ∪ ranker_train` (всё до теста) → `seen` = те же данные по пользователю → `recommend_batch` для пользователей из `test` → `evaluate(n_items = число фильмов в movies)`.
 
-- [ ] **Step 1: Тест на синтетике.** В `tmp_path` пишутся `ratings.dat` и `movies.dat` в формате ML-1M (30 пользователей × 20 оценок, фильм 1 оценили все). Проверки: ключи `{"ndcg@10", "recall@10", "coverage"}`, все значения в `[0, 1]`, два запуска дают одинаковый результат.
+- [ ] **Step 1: Тест на синтетике.** В `tmp_path` пишутся `ratings.dat` и `movies.dat` в формате ML-1M (30 пользователей × 20 оценок, фильм 1 оценили все). Проверки: ключи `{"ndcg_at_10", "recall_at_10", "coverage"}`, все значения в `[0, 1]`, два запуска дают одинаковый результат.
 - [ ] **Step 2: Запустить и увидеть падение.** Run: `uv run pytest tests/unit/test_baseline.py -v`. Expected: FAIL.
 - [ ] **Step 3: Реализовать `run_baseline` и `main()` на `argparse`** (`if __name__ == "__main__": main()`).
 - [ ] **Step 4: Тест проходит, затем прогон на реальных данных.** Run: `uv run pytest -v`. Expected: все passed.
   Run: `uv run python -m recsys.pipelines.baseline --data-dir data/raw/ml-1m`
-  Expected: три строки с метриками, `ndcg@10 > 0`, `coverage < 0.1` (популярное всем советует почти одно и то же, ожидаем единицы процентов). Числа записать: это планка, которую ALS обязан побить на этапе 2.
+  Expected: три строки с метриками, `ndcg_at_10 > 0`, `coverage < 0.1` (популярное всем советует почти одно и то же, ожидаем единицы процентов). Числа записать: это планка, которую ALS обязан побить на этапе 2.
 - [ ] **Step 5: EDA-ноутбук.** `uv add --group notebooks jupyter matplotlib`. В `notebooks/01_eda.ipynb` пять вопросов, у каждого ячейка с графиком и вывод одной строкой:
   1. распределение оценок 1–5;
   2. число оценок на пользователя (лог-шкала: длинный хвост);
