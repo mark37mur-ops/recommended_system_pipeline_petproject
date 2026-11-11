@@ -54,10 +54,12 @@ RUN_DIR = "{{ ti.xcom_pull(task_ids='evaluate') }}"
 )
 def retrain_daily():
     @task.external_python(**RECSYS)
-    def extract_ratings(run_id: str, include_web: bool) -> str:
+    # Not called `run_id`: that name is reserved for Airflow's context, and Airflow refuses a
+    # task argument shadowing it (only at run time, see tests/dags).
+    def extract_ratings(airflow_run_id: str, include_web: bool) -> str:
         from recsys.pipelines import retrain
 
-        return retrain.extract_ratings(run_id, include_web=include_web)
+        return retrain.extract_ratings(airflow_run_id, include_web=include_web)
 
     @task.external_python(**RECSYS)
     def validate_data(run_dir: str) -> str:

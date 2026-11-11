@@ -82,6 +82,22 @@ def test_recsys_tasks_run_in_the_recsys_venv(dagbag):
                 assert t.expect_airflow is False
 
 
+def test_task_arguments_do_not_shadow_airflow_context_keys(dagbag):
+    """A TaskFlow parameter named like a context key (run_id, ds, params...) is rejected only
+    when the task executes ("is a part of kwargs and therefore reserved"), not at parse time."""
+    import inspect
+
+    from airflow.sdk.definitions.context import KNOWN_CONTEXT_KEYS
+
+    for dag in dagbag.dags.values():
+        for t in dag.tasks:
+            callable_ = getattr(t, "python_callable", None)
+            if callable_ is None:
+                continue
+            clashes = set(inspect.signature(callable_).parameters) & set(KNOWN_CONTEXT_KEYS)
+            assert not clashes, (dag.dag_id, t.task_id, clashes)
+
+
 @pytest.mark.skipif(not Path(RECSYS_PYTHON).exists(), reason="only inside the Airflow image")
 def test_recsys_venv_imports_the_pipeline_with_its_own_pins():
     code = (
