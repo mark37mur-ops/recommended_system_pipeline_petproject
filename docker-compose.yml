@@ -107,6 +107,10 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - ./infra/postgres/init:/init:ro
+    # The postgres image declares VOLUME /var/lib/postgresql/data; without this every
+    # recreation of this client-only job would leave an anonymous volume behind.
+    tmpfs:
+      - /var/lib/postgresql/data
     depends_on:
       postgres:
         condition: service_healthy
