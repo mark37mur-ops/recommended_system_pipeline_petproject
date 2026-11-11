@@ -188,8 +188,8 @@ DEFAULT_SWEEP_GRID: tuple[ALSConfig, ...] = tuple(
     ALSConfig(factors=f, regularization=r, alpha=a)
     for f in (32, 64, 128)
     for r in (0.05, 5.0)
-    for a in (0.5, 1.0, 2.0)
-) + (ALSConfig(rating_weight="binary"),)
+    for a in (0.25, 0.5, 1.0, 2.0)
+) + (ALSConfig(rating_weight="binary", alpha=1.0),)
 
 
 def flatten_config(config: TrainConfig) -> dict[str, object]:

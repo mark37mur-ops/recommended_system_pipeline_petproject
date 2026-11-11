@@ -38,7 +38,7 @@ def confidence_weights(ratings: ArrayLike, scheme: str = "linear") -> np.ndarray
 class ALSConfig:
     factors: int = 64
     regularization: float = 0.05
-    alpha: float = 1.0
+    alpha: float = 0.5
     iterations: int = 15
     rating_weight: str = "linear"
     random_state: int = 42
