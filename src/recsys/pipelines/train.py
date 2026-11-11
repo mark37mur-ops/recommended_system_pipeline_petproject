@@ -359,7 +359,13 @@ def run_training(
             run.info.run_id,
             result.metrics[result.variant],
             snapshot,
-            tags={"variant": result.variant, "git_sha": data_tags["git_sha"]},
+            # Raw MovieLens files only (retrain_daily tags its versions the same way).
+            tags={
+                "variant": result.variant,
+                "git_sha": data_tags["git_sha"],
+                "include_web": "false",
+                "n_web_ratings": "0",
+            },
             name=model_name,
             k=k,
             beats_popularity=beats_popularity,

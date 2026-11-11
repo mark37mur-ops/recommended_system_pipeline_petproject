@@ -5,7 +5,13 @@ up against the current champion (spec 4.2).
       -> evaluate -> decide_promotion -> promote -> set_champion_alias -> reload_api
                                       -> skip    -> log_reason
 
-Trigger with `include_web=false` to train on MovieLens ratings only (spec 3.4).
+Params (Trigger DAG w/ config):
+- `include_web=false`: train on MovieLens ratings only (spec 3.4). Such a run is
+  evaluation-only: compared and logged, never promoted...
+- `allow_promotion=true`: ...unless this is set too (incident: web data poisoned, a
+  MovieLens-only model has to replace the champion; the spec 4.2 rule still applies).
+- `allow_count_drop=true`: accept >5% fewer ratings than the previous run, or all web
+  ratings gone (after a deliberate clean-up; otherwise every later run fails as well).
 """
 
 import os
@@ -46,8 +52,19 @@ RUN_DIR = "{{ ti.xcom_pull(task_ids='evaluate') }}"
     default_args={"retries": 2, "retry_delay": timedelta(minutes=2)},
     params={
         "include_web": Param(True, type="boolean", description="train on web ratings too"),
+        "allow_promotion": Param(
+            False,
+            type="boolean",
+            description="let an include_web=false run replace the champion (incident only)",
+        ),
+        "allow_count_drop": Param(
+            False,
+            type="boolean",
+            description="accept >5% fewer ratings or no web ratings (after a clean-up)",
+        ),
     },
-    # Templates render to Python objects, so params.include_web arrives as a bool.
+    # Templates render to Python objects, so params arrive as bools. recsys parses the
+    # string forms as well (parse_flag): "False" must never be taken as true.
     render_template_as_native_obj=True,
     tags=["recsys", "training"],
     doc_md=__doc__,
@@ -62,10 +79,10 @@ def retrain_daily():
         return retrain.extract_ratings(airflow_run_id, include_web=include_web)
 
     @task.external_python(**RECSYS)
-    def validate_data(run_dir: str) -> str:
+    def validate_data(run_dir: str, allow_count_drop: bool) -> str:
         from recsys.pipelines import retrain
 
-        return retrain.validate_data(run_dir)
+        return retrain.validate_data(run_dir, allow_count_drop=allow_count_drop)
 
     @task.external_python(**RECSYS)
     def drift_report(run_dir: str) -> str:
@@ -100,10 +117,10 @@ def retrain_daily():
     # The branch returns the id of the task to run next ("promote" or "skip"); Airflow marks
     # the other branch as skipped.
     @task.branch_external_python(**RECSYS)
-    def decide_promotion(run_dir: str) -> str:
+    def decide_promotion(run_dir: str, allow_promotion: bool) -> str:
         from recsys.pipelines import retrain
 
-        return retrain.decide_promotion(run_dir)
+        return retrain.decide_promotion(run_dir, allow_promotion=allow_promotion)
 
     @task.external_python(**RECSYS)
     def promote(run_dir: str) -> str:
@@ -132,9 +149,10 @@ def retrain_daily():
         return retrain.log_reason(run_dir)
 
     run_dir = extract_ratings("{{ run_id }}", "{{ params.include_web }}")
-    for step in (validate_data, drift_report, split_data, train_als, train_ranker, evaluate):
+    run_dir = validate_data(run_dir, "{{ params.allow_count_drop }}")
+    for step in (drift_report, split_data, train_als, train_ranker, evaluate):
         run_dir = step(run_dir)
-    branch = decide_promotion(run_dir)
+    branch = decide_promotion(run_dir, "{{ params.allow_promotion }}")
 
     promoted = promote(RUN_DIR)
     branch >> promoted

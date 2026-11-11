@@ -86,14 +86,16 @@ def env(tmp_path_factory):
     )
 
 
-def run_until_decision(run_id: str, env: PipelineSettings, ratings: pd.DataFrame) -> str:
+def run_until_decision(
+    run_id: str, env: PipelineSettings, ratings: pd.DataFrame, include_web: bool = True
+) -> str:
     rd = write_snapshot(
         RunDir.for_run(run_id, env.runs_root),
         run_id,
         ratings,
         make_movies(),
         make_users(),
-        include_web=True,
+        include_web=include_web,
     )
     run_dir = str(rd.root)
     for task in (validate_data, drift_report, split_data, train_als, train_ranker, evaluate):
@@ -123,11 +125,11 @@ def mlflow_run(env, run_dir):
 # ----- validate_data ---------------------------------------------------------------------
 
 
-def _validate(env, tmp_path, run_id, ratings, include_web=True):
+def _validate(env, tmp_path, run_id, ratings, include_web=True, **kwargs):
     rd = write_snapshot(
         RunDir.for_run(run_id, tmp_path), run_id, ratings, make_movies(), make_users(), include_web
     )
-    return validate_data(str(rd.root), dataclasses.replace(env, runs_root=tmp_path))
+    return validate_data(str(rd.root), dataclasses.replace(env, runs_root=tmp_path), **kwargs)
 
 
 def _recorded(env, run_id) -> bool:
@@ -177,6 +179,39 @@ def test_validate_row_count_drop_rule(env, tmp_path):
     assert _recorded(env, "drop-4pct")
 
 
+@pytest.mark.parametrize("allow", [True, "true", "1"])
+def test_validate_count_drop_can_be_overridden(env, tmp_path, allow):
+    """After a deliberate clean-up (spam removed) every later run would fail on the -5% rule
+    forever: failed runs are not recorded, so the baseline never moves. allow_count_drop is the
+    documented way out."""
+    engine = create_engine(env.database_url)
+    base = snapshot(with_web=False)
+    n = len(base)
+    record_run(engine, RunRecord(f"cleanup-base-{allow}", False, n, "x", {"n_ratings": n}))
+    engine.dispose()
+    run_id = f"cleanup-{allow}"
+    _validate(env, tmp_path, run_id, base.iloc[: n // 2], include_web=False, allow_count_drop=allow)
+    assert _recorded(env, run_id)
+    assert read_json(RunDir.for_run(run_id, tmp_path).validation_json)["allow_count_drop"] is True
+
+
+def test_validate_fails_when_all_web_ratings_disappear(env, tmp_path):
+    """Web ratings are 0.16% of the data, so losing all of them passes the -5% rule; they are
+    the only data that cannot be re-downloaded (spec 6.2), so this is checked on its own."""
+    engine = create_engine(env.database_url)
+    full = snapshot(with_web=True)
+    summary = {"n_ratings": len(full), "n_web_ratings": len(web_ratings())}
+    record_run(engine, RunRecord("web-base", True, len(full), "x", summary))
+    engine.dispose()
+
+    no_web = snapshot(with_web=False)
+    with pytest.raises(DataValidationError, match="web ratings"):
+        _validate(env, tmp_path, "web-gone", no_web, include_web=True)
+    assert not _recorded(env, "web-gone")
+    _validate(env, tmp_path, "web-gone-ok", no_web, include_web=True, allow_count_drop=True)
+    assert _recorded(env, "web-gone-ok")
+
+
 # ----- the full chain ----------------------------------------------------------------------
 
 
@@ -204,6 +239,10 @@ def test_first_run_promotes_and_logs_everything(env, first):
     champion = client(env).get_model_version_by_alias(MODEL, CHAMPION_ALIAS)
     assert str(champion.version) == "1"
     assert champion.tags["airflow_run_id"] == "manual__first:1"
+    # where the model came from is visible in the registry, not only on the run (review I1)
+    assert champion.tags["include_web"] == "true"
+    assert champion.tags["n_web_ratings"] == str(len(web_ratings()))
+    assert champion.tags["data_snapshot"] == tags["data_snapshot"]
 
 
 def test_previous_count_and_drift_compare_with_the_previous_run(env, first):
@@ -220,18 +259,21 @@ def test_tasks_are_idempotent_for_the_same_run(env, first):
     split_before = pd.read_parquet(rd.split_path("test"))
     eval_before = read_json(rd.evaluate_json)
     versions_before = client(env).search_model_versions(f"name='{MODEL}'")
+    promotion_before = read_json(rd.promotion_json)
 
     for task in (validate_data, drift_report, split_data, train_als, train_ranker, evaluate):
         assert task(first, env) == first
     pd.testing.assert_frame_equal(pd.read_parquet(rd.split_path("test")), split_before)
+    # After the promotion the champion is this run's own model. Re-running evaluate must not
+    # compare the model with itself, re-log it, or change what the decision was based on.
+    assert read_json(rd.evaluate_json) == eval_before
     assert decide_promotion(first, env) == PROMOTE_TASK
+    assert "already promoted v1" in read_json(rd.decision_json)["reason"]
     register_challenger(first, env)  # retry after success: no second version
     set_champion_alias(first, env)  # alias already there: no-op
     versions_after = client(env).search_model_versions(f"name='{MODEL}'")
     assert len(versions_after) == len(versions_before)
-    eval_after = read_json(rd.evaluate_json)
-    assert eval_after["metrics"] == eval_before["metrics"]
-    assert eval_after["challenger"] == eval_before["challenger"]
+    assert read_json(rd.promotion_json) == promotion_before  # previous champion: still none
     assert str(client(env).get_model_version_by_alias(MODEL, CHAMPION_ALIAS).version) == "1"
 
 
@@ -272,6 +314,59 @@ def test_extract_reuses_a_frozen_snapshot(env, tmp_path, monkeypatch):
     assert retrain.extract_ratings("frozen", settings) == str(rd.root)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("True", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("1", True),
+        (0, False),
+        (1, True),
+        (" no ", False),
+        ("yes", True),
+    ],
+)
+def test_parse_flag_accepts_bools_and_their_string_forms(value, expected):
+    """Templates render "{{ params.x }}" to a string unless render_template_as_native_obj is
+    on; "False" is truthy, so a plain bool() would silently include the web ratings."""
+    assert retrain.parse_flag(value, "x") is expected
+
+
+@pytest.mark.parametrize("value", ["maybe", "", None, 2, 0.5])
+def test_parse_flag_rejects_anything_else(value):
+    with pytest.raises(ValueError, match="include_web"):
+        retrain.parse_flag(value, "include_web")
+
+
+def test_extract_reads_string_flags_correctly(env, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_extract(engine, include_web=True):
+        calls.append(include_web)
+        return snapshot(), make_movies(), make_users()
+
+    monkeypatch.setattr(retrain, "extract_snapshot", fake_extract)
+    settings = dataclasses.replace(env, runs_root=tmp_path)
+    run_dir = retrain.extract_ratings("string-flag", settings, include_web="False")
+    assert calls == [False]
+    assert read_json(RunDir(run_dir).extract_json)["include_web"] is False
+
+
+def test_extract_refuses_a_folder_of_another_run(env, tmp_path):
+    """safe_run_id maps "a:b" and "a-b" to one folder; the second run must not silently train
+    on the first one's frozen snapshot (review M9)."""
+    write_snapshot(
+        RunDir.for_run("a:b", tmp_path), "a:b", snapshot(), make_movies(), make_users(), True
+    )
+    settings = dataclasses.replace(env, runs_root=tmp_path)
+    with pytest.raises(RuntimeError, match="a:b"):
+        retrain.extract_ratings("a-b", settings)
+
+
 def test_extract_writes_the_snapshot_once(env, tmp_path, monkeypatch):
     calls = []
 
@@ -292,10 +387,11 @@ def test_extract_writes_the_snapshot_once(env, tmp_path, monkeypatch):
 # ----- decide_promotion branches, guards ------------------------------------------------
 
 
-def _fake_evaluation(rd: RunDir, challenger, champion, beats_popularity=True):
+def _fake_evaluation(rd: RunDir, challenger, champion, beats_popularity=True, include_web=True):
     from recsys.pipelines.run_dir import write_json_atomic
 
-    rd.root.mkdir(parents=True, exist_ok=True)
+    rd.extract_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(rd.extract_json, {"run_id": "fake", "include_web": include_web})
     write_json_atomic(rd.mlflow_json, {"run_id": "unused", "experiment_id": "0"})
     write_json_atomic(
         rd.evaluate_json,
@@ -350,6 +446,87 @@ def test_decide_promotion_branches(
     assert reason in decision["reason"]
 
 
+BETTER = {"ndcg_at_10": 0.12, "coverage": 0.2}
+WITHIN = {"ndcg_at_10": 0.096, "coverage": 0.2}
+WORSE = {"ndcg_at_10": 0.05, "coverage": 0.2}
+CHAMP = {"ndcg_at_10": 0.1, "coverage": 0.2}
+
+
+@pytest.mark.parametrize(
+    ("challenger", "champion", "allow", "branch", "reason"),
+    [
+        (BETTER, CHAMP, False, SKIP_TASK, "evaluation-only"),
+        (BETTER, None, False, SKIP_TASK, "evaluation-only"),  # even without a champion
+        (BETTER, CHAMP, "False", SKIP_TASK, "evaluation-only"),
+        (BETTER, CHAMP, "0", SKIP_TASK, "evaluation-only"),
+        (BETTER, CHAMP, True, PROMOTE_TASK, "within tolerance"),
+        (WITHIN, CHAMP, "true", PROMOTE_TASK, "within tolerance"),
+        (WORSE, CHAMP, True, SKIP_TASK, "< champion"),  # the override does not bypass the rule
+    ],
+    ids=["default", "no-champion", "str-False", "str-0", "allowed", "allowed-str", "allowed-worse"],
+)
+def test_no_web_runs_are_evaluation_only_unless_allowed(
+    env, tmp_path, monkeypatch, challenger, champion, allow, branch, reason
+):
+    """Review I1: a MovieLens-only model is measured without the API's live audience, so it
+    must never replace the champion as a side effect of an experiment. allow_promotion is the
+    explicit switch for the incident case (web data poisoned)."""
+    monkeypatch.setattr(retrain, "_set_run_tags", lambda *a, **k: None)
+    rd = RunDir(tmp_path / "noweb")
+    _fake_evaluation(rd, challenger, champion, include_web=False)
+    assert decide_promotion(str(rd.root), env, allow_promotion=allow) == branch
+    decision = read_json(rd.decision_json)
+    assert reason in decision["reason"]
+    assert decision["include_web"] is False
+    assert decision["allow_promotion"] is retrain.parse_flag(allow, "allow_promotion")
+
+
+def test_allow_promotion_changes_nothing_for_full_data_runs(env, tmp_path, monkeypatch):
+    monkeypatch.setattr(retrain, "_set_run_tags", lambda *a, **k: None)
+    for allow in (False, True):
+        rd = RunDir(tmp_path / f"web-{allow}")
+        _fake_evaluation(rd, WORSE, CHAMP, include_web=True)
+        assert decide_promotion(str(rd.root), env, allow_promotion=allow) == SKIP_TASK
+        _fake_evaluation(rd, WITHIN, CHAMP, include_web=True)
+        assert decide_promotion(str(rd.root), env, allow_promotion=allow) == PROMOTE_TASK
+
+
+def test_decide_after_promotion_reports_it_instead_of_comparing_again(env, tmp_path, monkeypatch):
+    """Review M2: "Clear" on decide_promotion after a successful promote must not end in a
+    skip ("champion v4 stays") while the alias already points at this run's model."""
+    from recsys.pipelines.run_dir import write_json_atomic
+
+    monkeypatch.setattr(retrain, "_set_run_tags", lambda *a, **k: None)
+    rd = RunDir(tmp_path / "done")
+    _fake_evaluation(rd, WORSE, CHAMP)  # would be a skip on a fresh comparison
+    write_json_atomic(
+        rd.promotion_json, {"version": "9", "expected_previous": "7", "promoted": True}
+    )
+    assert decide_promotion(str(rd.root), env) == PROMOTE_TASK
+    decision = read_json(rd.decision_json)
+    assert decision["promote"] is True and "already promoted v9" in decision["reason"]
+
+
+def test_no_web_chain_skips_and_registers_nothing(env, first, caplog):
+    """The whole chain with include_web=false, as the DAG runs it: evaluated and logged,
+    skip branch, the champion and the registry untouched."""
+    before = client(env).get_model_version_by_alias(MODEL, CHAMPION_ALIAS).version
+    n_versions = len(client(env).search_model_versions(f"name='{MODEL}'"))
+    run_dir = run_until_decision("manual__noweb", env, snapshot(with_web=False), include_web=False)
+    ev = read_json(RunDir(run_dir).evaluate_json)
+    assert ev["champion"] is not None  # the comparison is still made and logged
+    assert decide_promotion(run_dir, env) == SKIP_TASK
+    with caplog.at_level("WARNING", logger="recsys.retrain"):
+        log_reason(run_dir, env)
+    assert "evaluation-only" in caplog.text
+    tags = mlflow_run(env, run_dir).data.tags
+    assert tags["decision"] == SKIP_TASK and tags["promoted"] == "false"
+    assert tags["include_web"] == "false" and tags["allow_promotion"] == "false"
+    assert "evaluation-only" in tags["promotion_reason"]
+    assert client(env).get_model_version_by_alias(MODEL, CHAMPION_ALIAS).version == before
+    assert len(client(env).search_model_versions(f"name='{MODEL}'")) == n_versions
+
+
 def test_register_refuses_when_the_decision_was_skip(env, tmp_path, monkeypatch):
     monkeypatch.setattr(retrain, "_set_run_tags", lambda *a, **k: None)
     rd = RunDir(tmp_path / "skip")
@@ -361,7 +538,7 @@ def test_register_refuses_when_the_decision_was_skip(env, tmp_path, monkeypatch)
         register_challenger(str(rd.root), env)
 
 
-def test_log_reason_tags_the_run(env, tmp_path):
+def test_log_reason_tags_the_run(env, tmp_path, caplog):
     settings = dataclasses.replace(env, runs_root=tmp_path, model_name="skip-model")
     run_dir = run_until_decision("skip-run", settings, snapshot())
     rd = RunDir(run_dir)
@@ -373,7 +550,10 @@ def test_log_reason_tags_the_run(env, tmp_path):
 
     write_json_atomic(rd.evaluate_json, ev)
     assert decide_promotion(run_dir, settings) == SKIP_TASK
-    assert log_reason(run_dir, settings) == run_dir
+    with caplog.at_level("WARNING", logger="recsys.retrain"):
+        assert log_reason(run_dir, settings) == run_dir
+    # the log names the champion the alias points at now, not the one evaluate saw (M2)
+    assert "current champion: none" in caplog.text
     tags = mlflow_run(settings, run_dir).data.tags
     assert tags["promoted"] == "false"
     assert "< champion" in tags["promotion_reason"]

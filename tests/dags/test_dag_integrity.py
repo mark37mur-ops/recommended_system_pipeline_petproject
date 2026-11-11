@@ -3,7 +3,8 @@
 Needs Airflow, which is not in the project venv (its pins conflict with ours). Runs inside the
 Airflow image, locally and in CI:
     docker run --rm -v "$PWD:/repo" -w /repo --entrypoint bash movielens-recsys-airflow:local \
-        -c "pip install -q pytest && python -m pytest -p no:cacheprovider tests/dags"
+        -c "pip install -q pytest --constraint <Airflow constraints URL, see ci.yml> &&
+            python -m pytest -p no:cacheprovider tests/dags"
 Skipped everywhere else.
 """
 
@@ -56,6 +57,18 @@ def test_retrain_daily_has_the_spec_graph(dagbag):
     dag = dagbag.dags["retrain_daily"]
     assert _edges(dag) == RETRAIN_EDGES
     assert dag.task_dict["decide_promotion"].task_type.startswith("_BranchExternalPython")
+
+
+def test_retrain_daily_params_render_as_python_objects(dagbag):
+    """Without native rendering "{{ params.include_web }}" becomes the string "False"; recsys
+    parses strings too (parse_flag), but the DAG should hand over real booleans."""
+    dag = dagbag.dags["retrain_daily"]
+    assert dag.render_template_as_native_obj is True
+    defaults = {name: dag.params[name] for name in dag.params}
+    assert defaults == {"include_web": True, "allow_promotion": False, "allow_count_drop": False}
+    assert dag.task_dict["extract_ratings"].op_args[1] == "{{ params.include_web }}"
+    assert dag.task_dict["validate_data"].op_args[1] == "{{ params.allow_count_drop }}"
+    assert dag.task_dict["decide_promotion"].op_args[1] == "{{ params.allow_promotion }}"
 
 
 def test_bootstrap_data_has_the_spec_graph(dagbag):

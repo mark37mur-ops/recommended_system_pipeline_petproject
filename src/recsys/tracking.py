@@ -27,6 +27,8 @@ MODEL_NAME = "movielens-recommender"
 CHAMPION_ALIAS = "champion"
 NDCG_TOLERANCE = 0.005
 MAX_COVERAGE_DROP = 0.10
+# Metrics are means over thousands of users: 1e-9 is far below any real difference.
+_EPS = 1e-9
 # Where load_champion downloads model artifacts unless told otherwise (never the system temp
 # dir, which is on the small C: drive locally). The download is removed once loaded.
 DEFAULT_MODEL_DIR = Path("mlruns") / "tmp" / "champion"
@@ -110,11 +112,13 @@ def decide_promotion(
     if champion is None:
         return True, "no current champion"
     key = f"ndcg_at_{k}"
+    # Both bounds are inclusive ("no more than"); _EPS keeps an exact boundary on the right
+    # side of float rounding (0.2 * (1 - 0.10) = 0.18000000000000002 > 0.18).
     floor = champion[key] - ndcg_tolerance
-    if challenger[key] < floor:
+    if challenger[key] < floor - _EPS:
         return False, f"{key} {challenger[key]:.4f} < champion {champion[key]:.4f} - tolerance"
     min_coverage = champion["coverage"] * (1 - max_coverage_drop)
-    if challenger["coverage"] < min_coverage:
+    if challenger["coverage"] < min_coverage - _EPS:
         return False, (
             f"coverage {challenger['coverage']:.4f} dropped more than "
             f"{max_coverage_drop:.0%} from champion {champion['coverage']:.4f}"
@@ -223,13 +227,16 @@ def register_version(
 ) -> str:
     """Register `model_uri` as a new version of `name`, at most once per MLflow run.
 
-    The version number is remembered in the run's `registered_version` tag: a retry of the
-    task after a successful registration returns the same version instead of adding one."""
+    The registry itself is the source of truth: a version of `name` that already belongs to
+    `run_id` is reused. A retry after a crash anywhere in here (after register_model, between
+    two tags, before the run's `registered_version` tag) therefore never adds a second version,
+    and it writes every tag again, so the retry finishes what the first attempt started."""
     client = MlflowClient()
-    known = client.get_run(run_id).data.tags.get("registered_version")
-    if known is not None:
-        return known
-    version = str(mlflow.register_model(model_uri, name).version)
+    existing = client.search_model_versions(f"name='{name}' and run_id='{run_id}'")
+    if existing:
+        version = str(max(int(v.version) for v in existing))
+    else:
+        version = str(mlflow.register_model(model_uri, name).version)
     for key, value in tags.items():
         client.set_model_version_tag(name, version, key, value)
     client.set_tag(run_id, "registered_version", version)
