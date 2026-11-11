@@ -1,6 +1,6 @@
 # Local stack (spec 1, 6.2): Postgres (app, mlflow, airflow DBs), Redis, MLflow server, API,
 # Airflow (api-server + scheduler + dag-processor, LocalExecutor).
-#   cp .env.example .env   # and replace every change-me (the API refuses to start with them)
+#   cp .env.example .env   # and replace every change-me (the API and Airflow refuse them)
 #   docker compose up -d --build
 #   Airflow UI http://localhost:8080 (user admin, password AIRFLOW_ADMIN_PASSWORD):
 #     trigger bootstrap_data once (MovieLens 1M -> Postgres), then unpause retrain_daily.
@@ -206,11 +206,24 @@ services:
       retries: 5
 
   # ----- Airflow (spec 4) ------------------------------------------------------------------
-  # Creates or upgrades Airflow's metadata schema, then exits; the others wait for it.
+  # Refuses weak secrets, then creates or upgrades Airflow's metadata schema and exits; the
+  # others wait for it. `:?` only catches empty values, `change-me` is caught here, at
+  # container start (so `docker compose config` with .env.example stays valid for CI).
   airflow-init:
     <<: *airflow
     restart: "no"
-    command: ["airflow", "db", "migrate"]
+    command:
+      - bash
+      - -c
+      - /opt/recsys-venv/bin/python -m recsys.secrets_check && exec airflow db migrate
+    environment:
+      <<: *airflow-env
+      # Under their .env names, so the error says which line of .env to fix.
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+      AIRFLOW_FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in .env}
+      AIRFLOW_JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in .env}
+      AIRFLOW_API_SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?set AIRFLOW_API_SECRET_KEY in .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}
     depends_on:
       db-init:
         condition: service_completed_successfully
