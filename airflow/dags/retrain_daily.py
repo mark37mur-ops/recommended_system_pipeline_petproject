@@ -4,6 +4,7 @@ up against the current champion (spec 4.2).
     extract_ratings -> validate_data -> drift_report -> split -> train_als -> train_ranker
       -> evaluate -> decide_promotion -> promote -> set_champion_alias -> reload_api
                                       -> skip    -> log_reason
+    cleanup_impressions (on its own: retention of recommendation_impressions)
 
 Params (Trigger DAG w/ config):
 - `include_web=false`: train on MovieLens ratings only (spec 3.4). Such a run is
@@ -147,6 +148,16 @@ def retrain_daily():
         from recsys.pipelines import retrain
 
         return retrain.log_reason(run_dir)
+
+    # Outside the training chain: a failed clean-up never blocks a retrain, and a failed or
+    # skipped retrain never skips the clean-up.
+    @task.external_python(**RECSYS)
+    def cleanup_impressions() -> int:
+        from recsys.pipelines import retrain
+
+        return retrain.cleanup_impressions()
+
+    cleanup_impressions()
 
     run_dir = extract_ratings("{{ run_id }}", "{{ params.include_web }}")
     run_dir = validate_data(run_dir, "{{ params.allow_count_drop }}")

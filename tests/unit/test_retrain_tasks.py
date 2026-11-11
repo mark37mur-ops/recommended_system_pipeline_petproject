@@ -5,6 +5,7 @@ so these tests are also the "pipeline end-to-end on a small synthetic dataset" o
 """
 
 import dataclasses
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -15,7 +16,13 @@ from synthetic import make_movies, make_ratings, make_users
 
 from recsys.data.validate import DataValidationError
 from recsys.db.run_state import RunRecord, create_run_state, previous_run, record_run
-from recsys.db.schema import WEB_USER_ID_START, retrain_runs
+from recsys.db.schema import (
+    WEB_USER_ID_START,
+    drift_metrics,
+    recommendation_impressions,
+    retrain_runs,
+    run_metrics,
+)
 from recsys.models.als import ALSConfig
 from recsys.models.ranker import RankerConfig
 from recsys.pipelines import retrain
@@ -250,8 +257,9 @@ def test_previous_count_and_drift_compare_with_the_previous_run(env, first):
     assert previous_run(engine, "next-run", include_web=True).run_id == "manual__first:1"
     engine.dispose()
     drift = read_json(RunDir(first).drift_json)
-    assert drift["engine"] == "summary-v1"
-    assert drift["current"]["n_web_ratings"] == len(web_ratings())
+    assert drift["engine"] == "evidently"
+    assert drift["summary"]["engine"] == "summary-v1"
+    assert drift["summary"]["current"]["n_web_ratings"] == len(web_ratings())
 
 
 def test_tasks_are_idempotent_for_the_same_run(env, first):
@@ -572,3 +580,154 @@ def test_set_champion_alias_refuses_when_the_champion_moved(env, tmp_path):
         set_champion_alias(run_dir, settings)
     alias = client(settings).get_model_version_by_alias("race-model", CHAMPION_ALIAS)
     assert str(alias.version) == str(other.version)
+
+
+# ----- monitoring rows (stage 5) ---------------------------------------------------------------
+
+
+def _rows(env, table, **where):
+    engine = create_engine(env.database_url)
+    try:
+        query = select(table)
+        for column, value in where.items():
+            query = query.where(table.c[column] == value)
+        with engine.connect() as conn:
+            return [dict(r) for r in conn.execute(query).mappings()]
+    finally:
+        engine.dispose()
+
+
+def test_drift_without_recent_web_data_is_recorded_as_insufficient(env, first):
+    # web_ratings() are from September: outside the 7 days before the snapshot
+    [row] = _rows(env, drift_metrics, run_id="manual__first:1")
+    assert row["drift_share"] is None and row["prediction_drift_share"] is None
+    assert row["ratings_status"] == row["recommendations_status"] == "insufficient_data"
+    assert row["n_current"] == 0 and row["n_reference"] == len(make_ratings())
+    run = mlflow_run(env, first)
+    assert "drift_share" not in run.data.metrics  # not computed, not 0
+    assert run.data.tags["drift_ratings_status"] == "insufficient_data"
+    drift_files = {a.path for a in client(env).list_artifacts(run.info.run_id, "drift")}
+    assert {"drift/drift.json", "drift/ratings.html", "drift/recommendations.html"} <= drift_files
+
+
+def test_evaluate_writes_run_metrics_for_the_dashboard(env, first):
+    rows = {r["metric"]: r["value"] for r in _rows(env, run_metrics, run_id="manual__first:1")}
+    evaluation = read_json(RunDir(first).evaluate_json)
+    assert rows["challenger_foldin_ndcg_at_10"] == pytest.approx(
+        evaluation["challenger"]["ndcg_at_10"]
+    )
+    assert rows["popularity_ndcg_at_10"] == pytest.approx(
+        evaluation["metrics"]["popularity"]["ndcg_at_10"]
+    )
+    assert "champion_foldin_ndcg_at_10" not in rows  # first run: no champion yet
+
+
+def test_drift_with_fresh_web_ratings_and_impressions(env, tmp_path):
+    """Visitors who rated today and were shown the model's recommendations: both Evidently
+    sections run, drift_share lands in MLflow and in drift_metrics, a retry keeps one row."""
+    settings = dataclasses.replace(env, runs_root=tmp_path)
+    now = datetime.now(UTC)
+    fresh = web_ratings(n_users=6, per_user=15).assign(
+        timestamp=int((now - timedelta(hours=2)).timestamp())
+    )
+    ratings = pd.concat([make_ratings().assign(source="movielens"), fresh], ignore_index=True)
+    engine = create_engine(env.database_url)
+    recommendation_impressions.create(engine, checkfirst=True)
+    shown_at = now - timedelta(hours=1)
+    with engine.begin() as conn:
+        conn.execute(
+            recommendation_impressions.insert(),
+            [
+                {
+                    "user_id": WEB_USER_ID_START + visitor,
+                    "movie_id": m,
+                    "position": m,
+                    "model_version": "1",
+                    "path": "full",
+                    "shown_at": shown_at,
+                }
+                for visitor in range(6)
+                for m in range(1, 11)
+            ]
+            + [  # cold-start impressions are not the model's predictions: not counted
+                {
+                    "user_id": WEB_USER_ID_START,
+                    "movie_id": 1,
+                    "position": 1,
+                    "model_version": None,
+                    "path": "cold_start",
+                    "shown_at": shown_at,
+                }
+            ],
+        )
+    engine.dispose()
+    rd = write_snapshot(
+        RunDir.for_run("fresh-drift", tmp_path),
+        "fresh-drift",
+        ratings,
+        make_movies(),
+        make_users(),
+        include_web=True,
+    )
+    run_dir = str(rd.root)
+    validate_data(run_dir, settings)
+    drift_report(run_dir, settings)
+    drift_report(run_dir, settings)  # retry: same window, same row
+
+    [row] = _rows(env, drift_metrics, run_id="fresh-drift")
+    assert row["ratings_status"] == "ok" and row["n_current"] == len(fresh)
+    assert row["recommendations_status"] == "ok" and row["n_current_recommendations"] == 60
+    assert 0 < row["drift_share"] <= 1 and row["prediction_drift_share"] is not None
+    assert set(row["details"]["ratings"]) == {"rating", "genre", "release_year", "user_activity"}
+    report = read_json(rd.drift_json)
+    assert report["metrics"]["drift_share"] == pytest.approx(row["drift_share"])
+    run = mlflow_run(env, run_dir)
+    assert run.data.metrics["drift_share"] == pytest.approx(row["drift_share"])
+    assert run.data.metrics["prediction_drift_share"] == pytest.approx(
+        row["prediction_drift_share"]
+    )
+    assert (rd.drift_dir / "ratings.html").stat().st_size > 10_000
+
+
+def test_retrain_module_does_not_need_evidently_to_import():
+    """The API image has no Evidently: importing the pipeline modules must not pull it in."""
+    import subprocess
+    import sys as _sys
+
+    code = (
+        "import sys; import recsys.pipelines.retrain, recsys.pipelines.reload, recsys.drift; "
+        "assert 'evidently' not in sys.modules, 'evidently imported eagerly'"
+    )
+    subprocess.run([_sys.executable, "-c", code], check=True)
+
+
+def test_cleanup_impressions_deletes_rows_past_the_retention(env, tmp_path):
+    """s5-review I-4: recommendation_impressions must not grow without bound."""
+    from recsys.db.monitoring import IMPRESSIONS_RETENTION
+
+    db_url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
+    settings = dataclasses.replace(env, database_url=db_url)
+    engine = create_engine(db_url)
+    recommendation_impressions.create(engine, checkfirst=True)
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            recommendation_impressions.insert(),
+            [
+                {
+                    "user_id": WEB_USER_ID_START,
+                    "movie_id": m,
+                    "position": 1,
+                    "model_version": "1",
+                    "path": "full",
+                    "shown_at": at,
+                }
+                for m, at in ((1, now - IMPRESSIONS_RETENTION - timedelta(days=1)), (2, now))
+            ],
+        )
+    assert retrain.cleanup_impressions(settings) == 1
+    assert retrain.cleanup_impressions(settings) == 0
+    with engine.connect() as conn:
+        left = conn.execute(select(recommendation_impressions.c.movie_id)).scalars().all()
+    engine.dispose()
+    assert left == [2]

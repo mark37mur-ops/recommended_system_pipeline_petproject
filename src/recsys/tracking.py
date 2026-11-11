@@ -269,6 +269,8 @@ class ChampionModel:
     version: str
     run_id: str | None
     model_uri: str
+    # Unix seconds the version was created in the registry: the model's age (stage 5 alert).
+    created_at: float | None = None
 
 
 def _client(tracking_uri: str | None) -> tuple[MlflowClient, str]:
@@ -331,4 +333,9 @@ def load_champion(
         version=str(model_version.version),
         run_id=model_version.run_id,
         model_uri=model_uri,
+        created_at=(
+            None
+            if model_version.creation_timestamp is None
+            else model_version.creation_timestamp / 1000.0  # MLflow stores milliseconds
+        ),
     )

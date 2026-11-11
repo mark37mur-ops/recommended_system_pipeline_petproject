@@ -40,4 +40,6 @@ ENV PATH=/opt/venv/bin:$PATH \
 WORKDIR /app
 USER app
 EXPOSE 8000
-CMD ["uvicorn", "--factory", "recsys_api.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--no-server-header"]
+# --no-access-log: the app writes one JSON line per request itself (route template, status,
+# duration; spec 5.6), uvicorn's text access log would duplicate it with raw URLs.
+CMD ["uvicorn", "--factory", "recsys_api.main:create_app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--no-server-header", "--no-access-log"]

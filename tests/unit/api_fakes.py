@@ -30,6 +30,7 @@ class FakeRepository:
         self._ids = itertools.count(WEB_USER_ID_START)
         self.down = False
         self.calls: list[str] = []
+        self.impressions: list = []
 
     def _check(self, name: str) -> None:
         self.calls.append(name)
@@ -65,6 +66,12 @@ class FakeRepository:
             raise RatingQuotaExceeded(user_id)
         own[movie_id] = rating
         return len(own)
+
+    def insert_impressions(self, rows) -> None:
+        # Not recorded in `calls`: it runs in the writer thread, at its own pace.
+        if self.down:
+            raise DatabaseUnavailable("fake postgres is down")
+        self.impressions.extend(rows)
 
 
 class FakeStore:
@@ -131,7 +138,10 @@ class StubRecommender:
 
 
 class FakeChampion:
-    def __init__(self, recommender, version: str, run_id: str | None = "run") -> None:
+    def __init__(
+        self, recommender, version: str, run_id: str | None = "run", created_at=None
+    ) -> None:
         self.recommender = recommender
         self.version = version
         self.run_id = run_id
+        self.created_at = created_at

@@ -7,7 +7,14 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 
-from recsys.db.schema import create_schema, movies, ratings, users, web_user_id_seq
+from recsys.db.schema import (
+    create_schema,
+    movies,
+    ratings,
+    recommendation_impressions,
+    users,
+    web_user_id_seq,
+)
 from recsys_api.catalog import Movie
 from recsys_api.service import DatabaseUnavailable, RatingQuotaExceeded, UserNotFound
 
@@ -140,3 +147,16 @@ class PgRepository:
                 return int(n_before + (exists is None))
 
         return self._guard(run)
+
+    def insert_impressions(self, rows) -> None:
+        """One multi-row INSERT for a batch of `recsys_api.impressions.Impression` rows (runs in
+        the impression writer thread, never in a request)."""
+        if not rows:
+            return
+        values = [row._asdict() for row in rows]
+
+        def run():
+            with self.engine.begin() as conn:
+                conn.execute(recommendation_impressions.insert(), values)
+
+        self._guard(run)

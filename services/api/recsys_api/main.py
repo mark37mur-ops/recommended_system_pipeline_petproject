@@ -2,8 +2,12 @@
 
 Startup never blocks on MLflow or Postgres: the app serves immediately (popularity /
 degraded `/ready`) while a background thread creates the schema, loads the movie catalog and
-the champion model, retrying every `model_retry_seconds` until both succeed. Stage 5 adds
-`/metrics` here and passes a Prometheus `Observer`.
+the champion model, retrying every `model_retry_seconds` until both succeed.
+
+Monitoring (stage 5): `/metrics` for Prometheus (spec 5.1, `recsys_api.metrics`), every shown
+recommendation queued for `recommendation_impressions` (spec 5.2, `recsys_api.impressions`)
+and JSON logs on stdout (spec 5.6, `recsys.logs`). /metrics is served on the API port; in
+production Caddy must not proxy it to the internet (stage 6).
 """
 
 import hmac
@@ -18,17 +22,21 @@ from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from recsys.db.schema import make_engine
+from recsys.logs import configure_logging
 from recsys.models.als import pin_blas_threads
 from recsys.tracking import champion_version, load_champion
 from recsys_api.cache import KeyValueStore, RateLimiter, RecommendationCache, RedisStore
 from recsys_api.catalog import CatalogHolder
 from recsys_api.identity import COOKIE_NAME, CookieSigner
+from recsys_api.impressions import ImpressionLogger, ImpressionObserver, RecentImpressions
+from recsys_api.metrics import ApiMetrics, MetricsMiddleware, MetricsObserver
 from recsys_api.model import ModelHolder
-from recsys_api.observer import Observer
+from recsys_api.observer import CompositeObserver, Observer
 from recsys_api.schemas import (
     MovieList,
     MovieOut,
@@ -50,14 +58,30 @@ from recsys_api.settings import Settings
 log = logging.getLogger("recsys_api")
 
 HERE = Path(__file__).parent
+STATIC_PREFIX = "/static"
 COOKIE_MAX_AGE = 365 * 24 * 3600
 RELOAD_STATUS_CODES = {"loaded": 200, "unchanged": 200, "failed": 502, "busy": 409}
 
 
-def _configure_logging(level: str) -> None:
-    root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def route_uvicorn_logs() -> None:
+    """uvicorn gives its loggers text handlers before it builds the app; send them through the
+    root (JSON) handler instead, so its start-up and error lines are JSON too. A logger uvicorn
+    switched off has no handlers and does not propagate (`--no-access-log`, see
+    docker/api.Dockerfile: MetricsMiddleware writes one line per request instead, with the
+    route template rather than the raw URL); it stays off."""
+    for name in UVICORN_LOGGERS:
+        uvicorn_log = logging.getLogger(name)
+        if uvicorn_log.handlers:
+            uvicorn_log.handlers.clear()
+            uvicorn_log.propagate = True
+
+
+def _configure_logging(level: str, fmt: str) -> None:
+    if configure_logging(level, fmt):
+        route_uvicorn_logs()
     logging.getLogger("recsys_api").setLevel(level)
 
 
@@ -121,8 +145,7 @@ def create_app(
     """Wire the app. Arguments other than `settings` replace real Postgres / Redis / MLflow
     (tests); `background=False` runs one synchronous warm-up attempt instead of the thread."""
     settings = settings or Settings()
-    _configure_logging(settings.log_level)
-    observer = observer or Observer()
+    _configure_logging(settings.log_level, settings.log_format)
 
     if repo is None:
         from recsys_api.repository import PgRepository
@@ -137,6 +160,20 @@ def create_app(
         )
     if probe is None:
         probe = partial(champion_version, settings.mlflow_tracking_uri, settings.model_name)
+
+    metrics = ApiMetrics()
+    impressions = (
+        ImpressionLogger(repo.insert_impressions, metrics=metrics)
+        if settings.impressions_enabled
+        else None
+    )
+    observers: list[Observer] = [MetricsObserver(metrics)]
+    if impressions is not None:
+        recent = RecentImpressions(window=settings.impressions_dedup_seconds)
+        observers.append(ImpressionObserver(impressions, recent=recent))
+    if observer is not None:
+        observers.append(observer)
+    observer = CompositeObserver(observers)
 
     catalog = CatalogHolder()
 
@@ -158,6 +195,12 @@ def create_app(
         observer=observer,
         max_ratings=settings.max_ratings_per_user,
     )
+    # Every response with a cookie writes impressions and may run an inference: a script must
+    # not call /recommendations without bound (s5-review I-4). Own counter, generous budget;
+    # like the ratings limiter it lets everything through while Redis is down (spec 3.5).
+    recommendations_limiter = RateLimiter(
+        store, limit=settings.recommendations_rate_limit_per_minute
+    )
     if settings.session_secret is not None:
         secret = settings.session_secret.get_secret_value()
     else:
@@ -169,17 +212,23 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         pin_blas_threads()  # once per process, before any model is used
+        if impressions is not None:
+            impressions.start()
         if background:
             warmup.start()
         else:
             warmup.attempt()
         yield
         warmup.stop()
+        if impressions is not None:
+            impressions.close()
 
     app = FastAPI(title="MovieLens recommender", version="0.1.0", lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+    app.add_middleware(MetricsMiddleware, metrics=metrics, mounts=(STATIC_PREFIX,))
+    app.mount(STATIC_PREFIX, StaticFiles(directory=HERE / "static"), name="static")
     templates = Jinja2Templates(directory=HERE / "templates")
     app.state.service, app.state.models, app.state.catalog = service, models, catalog
+    app.state.metrics, app.state.impressions = metrics, impressions
 
     def current_user(request: Request) -> int | None:
         return signer.verify(request.cookies.get(COOKIE_NAME))
@@ -239,7 +288,15 @@ def create_app(
     def recommendations(
         request: Request, k: Annotated[int, Query(ge=1, le=MAX_K)] = 10
     ) -> RecommendationsOut:
-        rec = service.recommend(current_user(request), k)
+        user_id = current_user(request)
+        keys = [f"recs:ip:{client_ip(request)}"] + (
+            [f"recs:user:{user_id}"] if user_id is not None else []
+        )
+        if not recommendations_limiter.allow(keys):
+            raise HTTPException(
+                429, "too many requests, try again in a minute", headers={"Retry-After": "60"}
+            )
+        rec = service.recommend(user_id, k)
         current = catalog.current
         items = [MovieOut.of(current.get(m)) for m in rec.movie_ids if m in current]
         return RecommendationsOut(
@@ -250,6 +307,11 @@ def create_app(
             min_ratings=service.min_personal,
             cached=rec.cached,
         )
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        body, content_type = metrics.render()
+        return Response(body, headers={"Content-Type": content_type})
 
     @app.get("/health")
     def health() -> dict:
@@ -302,4 +364,7 @@ def create_app(
         )
         return JSONResponse(body.model_dump(), status_code=RELOAD_STATUS_CODES[result.status])
 
+    metrics.precreate_error_series(
+        sorted({route.path for route in app.routes if isinstance(route, APIRoute)})
+    )
     return app

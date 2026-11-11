@@ -32,6 +32,7 @@ class LoadedModel:
     version: str
     run_id: str | None
     loaded_at: float
+    created_at: float | None = None  # when this version was created in the registry
 
 
 @dataclass(frozen=True)
@@ -82,11 +83,15 @@ class ModelHolder:
             if self._validate is not None:
                 self._validate(champion.recommender)
             loaded = LoadedModel(
-                champion.recommender, str(champion.version), champion.run_id, self._clock()
+                champion.recommender,
+                str(champion.version),
+                champion.run_id,
+                self._clock(),
+                getattr(champion, "created_at", None),
             )
             self._current = loaded  # the swap
             self.last_error = None
-            self._observer.model_loaded(loaded.version, loaded.loaded_at)
+            self._observer.model_loaded(loaded.version, loaded.loaded_at, loaded.created_at)
             log.info("model version %s loaded (previous %s)", loaded.version, previous_version)
             return ReloadResult("loaded", loaded.version, previous_version)
         except Exception as exc:  # noqa: BLE001 - any failure keeps the old model

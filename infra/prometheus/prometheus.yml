@@ -1,0 +1,27 @@
+# Prometheus (spec 5.1): pulls metrics over HTTP from every target every scrape_interval and
+# keeps them as time series on its own volume. Grafana queries it for the service panels and
+# the alert rules (Grafana Alerting evaluates the rules, so no rule_files / Alertmanager here).
+# Retention is set on the command line in docker-compose.yml (7 days or 512 MB, whichever comes
+# first): this is a dashboard for "now", not a long-term archive.
+global:
+  # 15 s: fine enough for a 1-minute rate() and a 2-minute "API down" alert, cheap enough for
+  # one small server (a scrape of the API is ~10 KB).
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  # Not used by Grafana's alerts; kept equal to the scrape interval for ad-hoc rules.
+  evaluation_interval: 15s
+
+scrape_configs:
+  # The recommender API inside the compose network (service name `api`, container port 8000).
+  # /metrics is never exposed to the internet: Caddy (stage 6) does not proxy it, Prometheus
+  # reaches it over the internal Docker network only. `up{job="api"}` is 0 when a scrape
+  # fails, which is the "API is down" alert (spec 5.5).
+  - job_name: api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  # Prometheus itself: its own health (samples ingested, TSDB size, failed scrapes).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

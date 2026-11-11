@@ -44,9 +44,15 @@ from mlflow import MlflowClient
 from recsys.data.split import Split, temporal_split
 from recsys.data.validate import DataValidationError, validate_ratings
 from recsys.db.extract import extract_snapshot
+from recsys.db.monitoring import (
+    delete_old_impressions,
+    recent_impressions,
+    record_drift,
+    record_run_metrics,
+)
 from recsys.db.run_state import RunRecord, create_run_state, previous_run, record_run
 from recsys.db.schema import make_engine
-from recsys.drift import build_drift_report, summarize_ratings
+from recsys.drift import CURRENT_WINDOW, build_drift_sections, summarize_ratings, summary_report
 from recsys.evaluation import format_comparison, make_test_context
 from recsys.models.als import ALSCandidateGenerator
 from recsys.models.pyfunc import log_recommender
@@ -304,23 +310,82 @@ def validate_data(
 
 
 def drift_report(run_dir: str, settings: PipelineSettings | None = None) -> str:
-    """Stage 4 drift summary (recsys.drift; Evidently in stage 5). Never fails on drift."""
+    """Spec 5.3: Evidently reports (MovieLens vs web ratings of the last 7 days; what MovieLens
+    users rated vs what the model recommended) + the stage-4 summary against the previous run.
+
+    Outputs: run_dir/drift.json and run_dir/drift/*.html; MLflow artifacts drift/, metrics
+    drift_share / prediction_drift_share (only when computed) and drift_*; one drift_metrics
+    row in Postgres for Grafana. Never fails on drift or on missing data: too few web ratings
+    or impressions give status insufficient_data and a NULL share (recsys.drift)."""
     settings = prepare(settings)
     rd = RunDir(Path(run_dir))
     meta = read_json(rd.extract_json)
     current = read_json(rd.validation_json)["summary"]
+    # The 7-day window ends at the snapshot, not at "now": a retry computes the same report.
+    until = datetime.fromisoformat(meta["extracted_at"])
+    ratings, movies, _ = _snapshot(rd)
     engine = make_engine(settings.db_url())
     try:
         previous = previous_run(engine, meta["run_id"], meta["include_web"])
+        shown = recent_impressions(engine, since=until - CURRENT_WINDOW, until=until)
+        sections = build_drift_sections(ratings, movies, shown, until=until, out_dir=rd.drift_dir)
+        summary = summary_report(current, None if previous is None else previous.summary)
+        rating_part, rec_part = sections["ratings"], sections["recommendations"]
+        record_drift(
+            engine,
+            {
+                "run_id": meta["run_id"],
+                "include_web": bool(meta["include_web"]),
+                "drift_share": sections["drift_share"],
+                "prediction_drift_share": sections["prediction_drift_share"],
+                "ratings_status": rating_part["status"],
+                "recommendations_status": rec_part["status"],
+                "n_reference": rating_part["n_reference"],
+                "n_current": rating_part["n_current"],
+                "n_current_recommendations": rec_part["n_current"],
+                "details": {
+                    "window_start": sections["window_start"],
+                    "window_end": sections["window_end"],
+                    "ratings": rating_part["columns"],
+                    "recommendations": rec_part["columns"],
+                },
+            },
+        )
     finally:
         engine.dispose()
-    report = build_drift_report(current, None if previous is None else previous.summary)
+
+    metrics = dict(summary["metrics"])
+    for key in ("drift_share", "prediction_drift_share"):
+        if sections[key] is not None:  # MLflow metrics cannot be NULL: absent = not computed
+            metrics[key] = float(sections[key])
+    report = {"engine": sections["engine"], "summary": summary, "metrics": metrics} | {
+        key: sections[key] for key in ("window_start", "window_end", "ratings", "recommendations")
+    }
     write_json_atomic(rd.drift_json, report)
     run_id = _mlflow_run(rd, settings)
     with mlflow.start_run(run_id=run_id):
         mlflow.log_dict(report, "drift/drift.json")
-        mlflow.log_metrics(report["metrics"])
-    for key, value in sorted(report["metrics"].items()):
+        mlflow.log_artifacts(str(rd.drift_dir), "drift")
+        mlflow.log_metrics(metrics)
+        mlflow.set_tags(
+            {
+                "drift_ratings_status": rating_part["status"],
+                "drift_recommendations_status": rec_part["status"],
+            }
+        )
+    log.info(
+        "drift: ratings %s (share %s, %d current rows), recommendations %s (share %s, %d "
+        "impressions), window %s .. %s",
+        rating_part["status"],
+        sections["drift_share"],
+        rating_part["n_current"],
+        rec_part["status"],
+        sections["prediction_drift_share"],
+        rec_part["n_current"],
+        sections["window_start"],
+        sections["window_end"],
+    )
+    for key, value in sorted(metrics.items()):
         log.info("drift %s = %.4f", key, value)
     return run_dir
 
@@ -429,10 +494,10 @@ def evaluate(run_dir: str, settings: PipelineSettings | None = None) -> str:
     table = format_comparison(comparison, k)
 
     run_id = _mlflow_run(rd, settings)
+    metrics = run_metrics(result, k)
+    metrics |= {f"challenger_foldin_{key}": v for key, v in challenger.items()}
+    metrics |= {f"champion_foldin_{key}": v for key, v in (champion_metrics or {}).items()}
     with mlflow.start_run(run_id=run_id):
-        metrics = run_metrics(result, k)
-        metrics |= {f"challenger_foldin_{key}": v for key, v in challenger.items()}
-        metrics |= {f"champion_foldin_{key}": v for key, v in (champion_metrics or {}).items()}
         mlflow.log_metrics(metrics)
         mlflow.set_tags(
             {
@@ -450,6 +515,12 @@ def evaluate(run_dir: str, settings: PipelineSettings | None = None) -> str:
         mlflow.log_artifact(str(features_path))
         model_info = log_recommender(result.recommender, tmp_root=rd.scratch_dir)
 
+    # The same numbers for Grafana's "NDCG@10 of the last runs" (stage-5 plan, Decision 7).
+    engine = make_engine(settings.db_url())
+    try:
+        record_run_metrics(engine, read_json(rd.extract_json)["run_id"], metrics)
+    finally:
+        engine.dispose()
     write_json_atomic(
         rd.evaluate_json,
         {
@@ -604,6 +675,20 @@ def log_reason(run_dir: str, settings: PipelineSettings | None = None) -> str:
 
 
 # ----- CLI -----------------------------------------------------------------------------------
+
+
+def cleanup_impressions(settings: PipelineSettings | None = None) -> int:
+    """Retention of recommendation_impressions (s5-review I-4): delete rows older than
+    IMPRESSIONS_RETENTION. Runs in retrain_daily next to (not inside) the training chain.
+    Idempotent; returns the number of rows deleted."""
+    settings = prepare(settings)
+    engine = make_engine(settings.db_url())
+    try:
+        deleted = delete_old_impressions(engine)
+    finally:
+        engine.dispose()
+    log.info("deleted %d impressions past the retention", deleted)
+    return deleted
 
 
 def run_all(

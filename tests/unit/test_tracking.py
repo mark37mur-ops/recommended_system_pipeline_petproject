@@ -150,8 +150,10 @@ def test_first_version_becomes_champion_and_loads(tracking_uri, first_run, raw_d
     champion = load_champion(tracking_uri, name="test-model", dst_dir=tmp_path)
     assert champion.version == "1" and champion.run_id == run.run_id
     # the stage-3 trainer reads the raw MovieLens files: no web ratings, visible in the registry
-    tags = MlflowClient(tracking_uri=tracking_uri).get_model_version("test-model", "1").tags
-    assert tags["include_web"] == "false" and tags["n_web_ratings"] == "0"
+    version = MlflowClient(tracking_uri=tracking_uri).get_model_version("test-model", "1")
+    assert version.tags["include_web"] == "false" and version.tags["n_web_ratings"] == "0"
+    # the model's age for the stage-5 alert: registry creation time, in seconds
+    assert champion.created_at == version.creation_timestamp / 1000
     users = [1, 2, 3]
     assert champion.recommender.recommend_known_users(
         users
