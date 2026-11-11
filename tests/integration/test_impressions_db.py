@@ -11,6 +11,7 @@ from recsys.db.load_movielens import load_movielens
 from recsys.db.schema import (
     DASHBOARD_OBJECTS,
     DASHBOARD_READER,
+    ONLINE_METRIC_WINDOW,
     WEB_USER_ID_START,
     create_schema,
     ratings,
@@ -23,7 +24,9 @@ from recsys_api.repository import PgRepository
 
 from .test_api_flow import make_client
 
-T0 = datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
+# Relative to today: the views only look at the last ONLINE_METRIC_WINDOW (and at impressions
+# older than an hour). Two days ago at 10:00 keeps every test row within one calendar day.
+T0 = (datetime.now(UTC) - timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0)
 U1, U2 = WEB_USER_ID_START + 500, WEB_USER_ID_START + 501  # clear of the web-id sequence
 
 
@@ -152,6 +155,8 @@ def test_dashboard_role_reads_monitoring_objects_only(db):
         ).first()
         if exists is None:  # CI: no init script; compose: created by infra/postgres/init
             conn.execute(text(f"CREATE ROLE {DASHBOARD_READER} NOLOGIN"))
+        # granted by an older schema version (stage 5 before review): must be taken back
+        conn.execute(text(f"GRANT SELECT ON recommendation_outcomes TO {DASHBOARD_READER}"))
     create_schema(db)  # grants on every run, also when the role appeared after the tables
     with db.connect() as conn:
 
@@ -162,4 +167,93 @@ def test_dashboard_role_reads_monitoring_objects_only(db):
             ).scalar()
 
         assert all(can_read(obj) for obj in DASHBOARD_OBJECTS)
-        assert not any(can_read(obj) for obj in ("ratings", "users", "recommendation_impressions"))
+        private = ("ratings", "users", "recommendation_impressions", "recommendation_outcomes")
+        assert not any(can_read(obj) for obj in private)
+
+
+# ----- review fixes (s5-review I-3, I-4, M-1) -------------------------------------------------
+
+
+def outcomes(engine, where="true"):
+    with engine.connect() as conn:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                text(
+                    "SELECT user_id, movie_id, path, model_version, shown_at, rated_within_hour"
+                    f" FROM recommendation_outcomes WHERE {where}"
+                    " ORDER BY user_id, movie_id, path, model_version"
+                )
+            )
+        ]
+
+
+def daily(engine):
+    with engine.connect() as conn:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                text(
+                    "SELECT path, model_version, n_shown, n_rated_within_hour"
+                    " FROM online_quality_daily ORDER BY path, model_version"
+                )
+            )
+        ]
+
+
+def test_each_path_and_model_version_gets_its_own_first_impression(loaded_db):
+    """A pair first shown in cold_start and later by the model counts for the model too; a
+    pair already shown under v6 counts for v7 when v7 shows it."""
+    repo = PgRepository(loaded_db)
+    minute = timedelta(minutes=1)
+    repo.insert_impressions(shown(U1, [1, 2], T0, path="cold_start", version=None))
+    repo.insert_impressions(shown(U1, [1, 2], T0 + 5 * minute, path="full", version="6"))
+    repo.insert_impressions(shown(U1, [1], T0 + 7 * minute, path="full", version="6"))  # repeat
+    repo.insert_impressions(shown(U1, [2], T0 + 9 * minute, path="full", version="7"))
+    rate_at(loaded_db, U1, 1, 5, T0 + 6 * minute)  # after the cold-start and the v6 showing
+    rate_at(loaded_db, U1, 2, 4, T0 + 65 * minute)  # >= 1 h after cold start / v6, < 1 h after v7
+
+    assert outcomes(loaded_db) == [
+        (U1, 1, "cold_start", None, T0, True),
+        (U1, 1, "full", "6", T0 + 5 * minute, True),
+        (U1, 2, "cold_start", None, T0, False),
+        (U1, 2, "full", "6", T0 + 5 * minute, False),
+        (U1, 2, "full", "7", T0 + 9 * minute, True),
+    ]
+    assert daily(loaded_db) == [
+        ("cold_start", None, 2, 1),
+        ("full", "6", 2, 1),
+        ("full", "7", 1, 1),
+    ]
+
+
+def test_views_only_read_the_recent_window(loaded_db):
+    """The view sorts only the last ONLINE_METRIC_WINDOW of impressions (s5-review I-4)."""
+    repo = PgRepository(loaded_db)
+    old = datetime.now(UTC) - ONLINE_METRIC_WINDOW - timedelta(days=1)
+    repo.insert_impressions(shown(U1, [1], old))
+    repo.insert_impressions(shown(U1, [1, 2], T0))
+    assert [(m, at) for _, m, _, _, at, _ in outcomes(loaded_db)] == [(1, T0), (2, T0)]
+
+
+def test_daily_quality_counts_only_matured_impressions(loaded_db):
+    """An impression younger than an hour has no final outcome yet (s5-review M-1)."""
+    repo = PgRepository(loaded_db)
+    repo.insert_impressions(shown(U1, [1, 2], T0))
+    repo.insert_impressions(shown(U2, [3], datetime.now(UTC) - timedelta(minutes=10)))
+    assert daily(loaded_db) == [("full", "6", 2, 0)]
+    assert len(outcomes(loaded_db)) == 3  # the raw view still has it
+
+
+def test_old_impressions_are_cleaned_up_on_postgres(loaded_db):
+    from recsys.db.monitoring import IMPRESSIONS_RETENTION, delete_old_impressions
+
+    repo = PgRepository(loaded_db)
+    expired = datetime.now(UTC) - IMPRESSIONS_RETENTION - timedelta(days=1)
+    repo.insert_impressions(shown(U1, [1], expired))
+    repo.insert_impressions(shown(U1, [2], T0))
+    assert delete_old_impressions(loaded_db) == 1
+    assert delete_old_impressions(loaded_db) == 0
+    with loaded_db.connect() as conn:
+        left = conn.execute(select(recommendation_impressions.c.movie_id)).scalars().all()
+    assert left == [2]

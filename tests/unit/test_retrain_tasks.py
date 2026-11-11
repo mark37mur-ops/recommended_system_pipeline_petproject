@@ -639,14 +639,15 @@ def test_drift_with_fresh_web_ratings_and_impressions(env, tmp_path):
             recommendation_impressions.insert(),
             [
                 {
-                    "user_id": WEB_USER_ID_START,
+                    "user_id": WEB_USER_ID_START + visitor,
                     "movie_id": m,
-                    "position": i,
+                    "position": m,
                     "model_version": "1",
                     "path": "full",
                     "shown_at": shown_at,
                 }
-                for i, m in enumerate(list(range(1, 11)) * 6, start=1)
+                for visitor in range(6)
+                for m in range(1, 11)
             ]
             + [  # cold-start impressions are not the model's predictions: not counted
                 {
@@ -698,3 +699,35 @@ def test_retrain_module_does_not_need_evidently_to_import():
         "assert 'evidently' not in sys.modules, 'evidently imported eagerly'"
     )
     subprocess.run([_sys.executable, "-c", code], check=True)
+
+
+def test_cleanup_impressions_deletes_rows_past_the_retention(env, tmp_path):
+    """s5-review I-4: recommendation_impressions must not grow without bound."""
+    from recsys.db.monitoring import IMPRESSIONS_RETENTION
+
+    db_url = f"sqlite:///{(tmp_path / 'app.db').as_posix()}"
+    settings = dataclasses.replace(env, database_url=db_url)
+    engine = create_engine(db_url)
+    recommendation_impressions.create(engine, checkfirst=True)
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            recommendation_impressions.insert(),
+            [
+                {
+                    "user_id": WEB_USER_ID_START,
+                    "movie_id": m,
+                    "position": 1,
+                    "model_version": "1",
+                    "path": "full",
+                    "shown_at": at,
+                }
+                for m, at in ((1, now - IMPRESSIONS_RETENTION - timedelta(days=1)), (2, now))
+            ],
+        )
+    assert retrain.cleanup_impressions(settings) == 1
+    assert retrain.cleanup_impressions(settings) == 0
+    with engine.connect() as conn:
+        left = conn.execute(select(recommendation_impressions.c.movie_id)).scalars().all()
+    engine.dispose()
+    assert left == [2]

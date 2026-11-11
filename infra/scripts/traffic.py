@@ -9,9 +9,10 @@ Per visitor (own cookie jar):
 Plus anonymous traffic: recommendations without a cookie, searches and a few unknown URLs
 (404, endpoint label "unmatched").
 
-Ratings are rate-limited per IP (RATE_LIMIT_PER_MINUTE, default 30): on 429 the script waits
-for Retry-After. Raise the limit for a quick run, e.g. RATE_LIMIT_PER_MINUTE=600 in the
-environment of `docker compose up`.
+Ratings (RATE_LIMIT_PER_MINUTE, default 30) and recommendations
+(RECOMMENDATIONS_RATE_LIMIT_PER_MINUTE, default 120) are rate-limited per IP: on 429 the
+script waits for Retry-After. Raise the limits for a quick run, e.g. RATE_LIMIT_PER_MINUTE=600
+in the environment of `docker compose up`.
 
     python infra/scripts/traffic.py --base-url http://localhost:8000 --visitors 8
 """

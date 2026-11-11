@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     session_secret: SecretStr | None = None
     cookie_secure: bool = False  # true behind HTTPS (stage 6)
     cache_ttl_seconds: int = 600
-    rate_limit_per_minute: int = 30
+    rate_limit_per_minute: int = 30  # POST /ratings, per IP and per visitor
+    # GET /recommendations, per IP and per visitor: a person clicking around never gets near it
+    recommendations_rate_limit_per_minute: int = 120
     max_ratings_per_user: int = 300
     onboarding_size: int = 20
     model_retry_seconds: float = 30.0  # startup: retry MLflow / Postgres this often
@@ -40,6 +42,9 @@ class Settings(BaseSettings):
     # Write every shown recommendation to recommendation_impressions (spec 5.2), off the
     # request path. Off: no rows, no online metric.
     impressions_enabled: bool = True
+    # A (visitor, path, model version, movie) logged within this many seconds is not logged
+    # again: the online metric only uses its first impression (s5-review I-4). 0 = log all.
+    impressions_dedup_seconds: float = 3600.0
 
     @field_validator("admin_token", "session_secret", mode="before")
     @classmethod

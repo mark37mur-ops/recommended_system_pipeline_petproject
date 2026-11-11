@@ -269,6 +269,9 @@ def test_init_script_creates_a_read_only_reader():
     assert "create_reader grafana_reader" in script
     assert "default_transaction_read_only = on" in script
     assert "statement_timeout" in script
+    # role defaults can be overridden per session: the fence is CONNECT/TEMPORARY (M-7)
+    assert "REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC" in script
+    assert script.rstrip().endswith("lock_down_public")
 
 
 # ----- secrets ---------------------------------------------------------------------------------
@@ -325,15 +328,15 @@ class FakeGrafana:
         raise AssertionError(method)
 
 
-def test_publish_creates_enables_or_leaves_alone(publish):
+def test_publish_creates_or_leaves_alone_and_never_unpauses(publish):
     api = FakeGrafana()
     outcome, config = publish.ensure_public_dashboard(api, "recsys-overview")
     assert outcome == "created" and config["isEnabled"] and config["share"] == "public"
     assert publish.ensure_public_dashboard(api, "recsys-overview")[0] == "unchanged"
-    api.public["isEnabled"] = False
+    api.public["isEnabled"] = False  # an admin paused it (incident, leaked link)
     outcome, config = publish.ensure_public_dashboard(api, "recsys-overview")
-    assert outcome == "enabled" and api.public["isEnabled"] is True
-    assert ("PATCH", "/api/dashboards/uid/recsys-overview/public-dashboards/pd1") in api.calls
+    assert outcome == "paused" and api.public["isEnabled"] is False  # stays paused
+    assert not any(method == "PATCH" for method, _ in api.calls)
 
 
 def test_publish_reports_api_errors(publish):
@@ -342,3 +345,67 @@ def test_publish_reports_api_errors(publish):
 
     with pytest.raises(RuntimeError, match="HTTP 500"):
         publish.ensure_public_dashboard(broken, "recsys-overview")
+
+
+# ----- review fixes (s5-review I-1, I-2, M-6) ------------------------------------------------
+
+# Routes a visitor uses: Prometheus scrapes, healthcheck probes, the admin reload (seconds by
+# design, 502 on a failed reload), /ready (503 while degraded) and 404s are not visitor traffic.
+VISITOR_ROUTES = 'endpoint!~"/metrics|/health|/ready|/admin/.*|unmatched"'
+ENDPOINT_MATCHER = re.compile(r'endpoint\s*(?:=~|!~|!=|=)\s*"[^"]*"')
+
+
+def _panel(dashboard, title):
+    [panel] = [p for p in dashboard["panels"] if p["title"] == title]
+    return panel
+
+
+def _panel_exprs(dashboard, title):
+    return [t["expr"] for t in _panel(dashboard, title)["targets"]]
+
+
+def test_error_and_latency_alerts_and_panels_select_the_same_visitor_routes(dashboard, rules):
+    """s5-review I-2: /ready answers 503 while the API warms up and /health dilutes the
+    denominator; the 5xx share must count what the p95 counts."""
+    by_uid = {r["uid"]: r for r in rules}
+    exprs = {
+        "5xx alert": _expr(by_uid["recsys-api-5xx"]),
+        "latency alert": _expr(by_uid["recsys-api-latency"]),
+        **{
+            f"latency panel {i}": e
+            for i, e in enumerate(_panel_exprs(dashboard, "Latency p50 / p95 / p99"))
+        },
+        "error panel": _panel_exprs(dashboard, "Error share (5xx)")[0],
+    }
+    for name, expr in exprs.items():
+        selectors = [re.sub(r"\s+", "", m) for m in ENDPOINT_MATCHER.findall(expr)]
+        assert selectors, name
+        assert set(selectors) == {VISITOR_ROUTES}, (name, selectors)
+    # numerator and denominator of both 5xx ratios
+    assert _expr(by_uid["recsys-api-5xx"]).count(VISITOR_ROUTES) == 2
+    assert _panel_exprs(dashboard, "Error share (5xx)")[0].count(VISITOR_ROUTES) == 2
+
+
+def test_model_age_ignores_a_missing_or_unset_timestamp(dashboard, rules):
+    """s5-review I-1: before the first load (restart, MLflow down) the gauges are NaN; the
+    `> 0` filter drops them, the alert sees "no data" (= OK) and the panels "No data"."""
+    age = {r["uid"]: r for r in rules}["recsys-model-age"]
+    assert re.sub(r"\s+", "", _expr(age)) == (
+        'time()-max(model_created_timestamp_seconds{job="api"}>0)'
+    )
+    assert age["noDataState"] == "OK"
+    for title, metric in (
+        ("Model age", "model_created_timestamp_seconds"),
+        ("Loaded by the API", "model_loaded_timestamp_seconds"),
+    ):
+        [expr] = _panel_exprs(dashboard, title)
+        assert re.sub(r"\s+", "", expr) == f'time()-max({metric}{{job="api"}}>0)', title
+
+
+def test_public_dashboard_sql_reads_aggregates_only(dashboard):
+    """s5-review M-6: per-pair rows (user_id, movie_id, rating) stay out of Grafana's reach;
+    the online panels read the daily aggregate, and only matured impressions (> 1 h)."""
+    assert "recommendation_outcomes" not in DASHBOARD_OBJECTS
+    for title in ("Online: rated within 1 h", "Online: avg rating"):
+        [target] = _panel(dashboard, title)["targets"]
+        assert "online_quality_daily" in target["rawSql"], title

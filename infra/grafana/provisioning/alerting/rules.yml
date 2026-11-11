@@ -57,12 +57,15 @@ groups:
             datasourceUid: prometheus
             model:
               refId: A
-              # `or vector(0)`: no 5xx series exists until the first error; with it the ratio is
-              # 0 instead of "no data". Prometheus' own scrapes of /metrics are not traffic.
+              # Visitor routes only, the same selector as the p95 rule: /ready answers 503 while
+              # the API warms up or degrades (a state report, not a visitor error), a failed
+              # admin reload 502, and healthcheck probes of /health would dilute the
+              # denominator. `or vector(0)`: no 5xx sample before the first error -> ratio 0
+              # instead of "no data" (the API pre-creates status="500" series at 0 as well).
               expr: >-
-                (sum(rate(http_requests_total{job="api",endpoint!="/metrics",status=~"5.."}[5m]))
+                (sum(rate(http_requests_total{job="api",endpoint!~"/metrics|/health|/ready|/admin/.*|unmatched",status=~"5.."}[5m]))
                 or vector(0))
-                / sum(rate(http_requests_total{job="api",endpoint!="/metrics"}[5m]))
+                / sum(rate(http_requests_total{job="api",endpoint!~"/metrics|/health|/ready|/admin/.*|unmatched"}[5m]))
               instant: true
           - refId: C
             datasourceUid: __expr__
@@ -156,8 +159,10 @@ groups:
               refId: A
               # Age = now - creation time of the served version in the MLflow registry
               # (stage-5 plan, Decision 8). The API's load time would reset on every restart
-              # and hide a broken nightly retrain.
-              expr: time() - max(model_created_timestamp_seconds{job="api"})
+              # and hide a broken nightly retrain. `> 0` drops the NaN the API exports while no
+              # model is loaded (start-up, MLflow down): "no data" = OK here; "no model" is the
+              # fallback-share alert's job (Decision 27).
+              expr: time() - max(model_created_timestamp_seconds{job="api"} > 0)
               instant: true
           - refId: C
             datasourceUid: __expr__
@@ -176,3 +181,5 @@ groups:
           description: >-
             retrain_daily has not produced a new champion for 1.5 days: it is failing, or every
             challenger was rejected. Check the DAG runs in Airflow and decision tags in MLflow.
+            A rollback (champion alias moved back to an older version) fires this at once:
+            the age is that of the version in the registry; expected until the next promotion.

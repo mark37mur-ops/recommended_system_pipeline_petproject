@@ -8,7 +8,12 @@ import pytest
 from api_fakes import FakeChampion, FakeRepository, FakeStore, StubRecommender
 from fastapi.testclient import TestClient
 
-from recsys_api.impressions import Impression, ImpressionLogger, ImpressionObserver
+from recsys_api.impressions import (
+    Impression,
+    ImpressionLogger,
+    ImpressionObserver,
+    RecentImpressions,
+)
 from recsys_api.main import create_app
 from recsys_api.metrics import ApiMetrics
 from recsys_api.settings import Settings
@@ -186,9 +191,12 @@ def test_app_logs_every_shown_recommendation():
         assert app.state.impressions.flush(timeout=5)
     assert body["path"] == "full" and cached["cached"] is True
     shown = [m["movie_id"] for m in body["items"]]
+    # The cached repeat shows the same movies again within the hour: not logged twice
+    # (s5-review I-4); the online metric only ever uses the first impression of a pair.
     assert [(r.movie_id, r.position, r.path, r.model_version) for r in repo.impressions] == [
         (m, i, "full", "6") for i, m in enumerate(shown, start=1)
-    ] * 2  # the cached answer was shown too
+    ]
+    assert counter(app.state.metrics, "deduplicated") == 4
 
 
 @pytest.mark.parametrize("mode", ["hang", "fail"])
@@ -206,3 +214,77 @@ def test_a_stuck_or_failing_impression_write_does_not_affect_responses(mode):
             repo.release.set()
     finally:
         repo.release.set()
+
+
+# ----- repeated impressions (s5-review I-4) ----------------------------------------------------
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_a_pair_is_logged_once_per_group_within_the_window():
+    clock = Clock()
+    recent = RecentImpressions(window=3600, clock=clock)
+    user = 1_000_001
+    assert recent.fresh(user, "full", "6", [1, 2, 3]) == [(1, 1), (2, 2), (3, 3)]
+    clock.now += 1800
+    # a refresh shows the same three plus one more: only the new one, at its real position
+    assert recent.fresh(user, "full", "6", [1, 2, 3, 4]) == [(4, 4)]
+    # another group of the online metric (path, model version) counts on its own
+    assert recent.fresh(user, "cold_start", None, [1, 2]) == [(1, 1), (2, 2)]
+    assert recent.fresh(user, "full", "7", [2]) == [(1, 2)]
+    assert recent.fresh(user + 1, "full", "6", [1]) == [(1, 1)]
+    clock.now += 1799
+    assert recent.fresh(user, "full", "6", [1, 2, 3, 4]) == []
+    clock.now += 1  # an hour after 1-3 were logged: logged again; 4 is only 30 min old
+    assert recent.fresh(user, "full", "6", [1, 4]) == [(1, 1)]
+
+
+def test_recent_impressions_are_bounded():
+    clock = Clock()
+    recent = RecentImpressions(window=3600, max_entries=3, clock=clock)
+    assert len(recent.fresh(1_000_001, "full", "6", [1, 2, 3, 4, 5])) == 5
+    assert len(recent) == 3
+    assert recent.fresh(1_000_001, "full", "6", [1]) == [(1, 1)]  # evicted: logged again
+    clock.now += 7200
+    recent.fresh(1_000_002, "full", "6", [9])
+    assert len(recent) == 1  # expired entries are pruned
+
+
+def test_window_zero_logs_every_impression():
+    recent = RecentImpressions(window=0)
+    assert recent.fresh(1_000_001, "full", "6", [1, 2]) == [(1, 1), (2, 2)]
+    assert recent.fresh(1_000_001, "full", "6", [1, 2]) == [(1, 1), (2, 2)]
+
+
+def test_observer_skips_repeats_and_counts_them():
+    sink, metrics = Sink(), ApiMetrics()
+    logger = ImpressionLogger(sink, metrics=metrics)
+    observer = ImpressionObserver(logger, recent=RecentImpressions(window=3600))
+    observer.recommendations_served(1_000_001, "full", [7, 8, 9], "6", cached=False)
+    observer.recommendations_served(1_000_001, "full", [7, 8, 9], "6", cached=True)
+    observer.recommendations_served(1_000_001, "full", [7, 5], "6", cached=False)
+    logger.drain()
+    assert [(r.movie_id, r.position) for r in sink.rows] == [(7, 1), (8, 2), (9, 3), (5, 2)]
+    assert counter(metrics, "deduplicated") == 4
+    assert counter(metrics, "written") == 4
+
+
+def test_dropped_impressions_are_not_remembered_as_logged():
+    """Queue full: the rows are lost, so the next showing must be logged instead of skipped."""
+    metrics = ApiMetrics()
+    logger = ImpressionLogger(Sink(), metrics=metrics, max_queue=1)  # writer not started
+    observer = ImpressionObserver(logger, recent=RecentImpressions(window=3600))
+    observer.recommendations_served(1_000_001, "full", [1], "6", cached=False)  # queued
+    observer.recommendations_served(1_000_001, "full", [2], "6", cached=False)  # dropped
+    logger.drain()
+    observer.recommendations_served(1_000_001, "full", [1, 2], "6", cached=True)
+    logger.drain()
+    assert counter(metrics, "dropped") == 1
+    assert counter(metrics, "deduplicated") == 1  # movie 1
+    assert counter(metrics, "written") == 2  # movie 1 first time, movie 2 on the retry

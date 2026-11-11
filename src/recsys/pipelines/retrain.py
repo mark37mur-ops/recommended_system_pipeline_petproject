@@ -44,7 +44,12 @@ from mlflow import MlflowClient
 from recsys.data.split import Split, temporal_split
 from recsys.data.validate import DataValidationError, validate_ratings
 from recsys.db.extract import extract_snapshot
-from recsys.db.monitoring import recent_impressions, record_drift, record_run_metrics
+from recsys.db.monitoring import (
+    delete_old_impressions,
+    recent_impressions,
+    record_drift,
+    record_run_metrics,
+)
 from recsys.db.run_state import RunRecord, create_run_state, previous_run, record_run
 from recsys.db.schema import make_engine
 from recsys.drift import CURRENT_WINDOW, build_drift_sections, summarize_ratings, summary_report
@@ -670,6 +675,20 @@ def log_reason(run_dir: str, settings: PipelineSettings | None = None) -> str:
 
 
 # ----- CLI -----------------------------------------------------------------------------------
+
+
+def cleanup_impressions(settings: PipelineSettings | None = None) -> int:
+    """Retention of recommendation_impressions (s5-review I-4): delete rows older than
+    IMPRESSIONS_RETENTION. Runs in retrain_daily next to (not inside) the training chain.
+    Idempotent; returns the number of rows deleted."""
+    settings = prepare(settings)
+    engine = make_engine(settings.db_url())
+    try:
+        deleted = delete_old_impressions(engine)
+    finally:
+        engine.dispose()
+    log.info("deleted %d impressions past the retention", deleted)
+    return deleted
 
 
 def run_all(

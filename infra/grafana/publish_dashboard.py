@@ -6,7 +6,7 @@ page can only run the saved queries of its own panels, never an arbitrary query 
 data source. File provisioning cannot create public dashboards, so this one-shot job (compose
 service `grafana-publish`) does it through Grafana's HTTP API after every start:
 - not published yet -> create it (enabled, time picker on, no annotations);
-- published but paused -> enable it again;
+- published but paused (by an admin: incident, leaked link) -> left paused, with a warning;
 - published -> nothing to do.
 It prints the link. Standard library only: it runs in the API image.
 
@@ -74,16 +74,14 @@ def wait_for_dashboard(api: Api, uid: str, timeout: float = 120.0, step: float =
 
 
 def ensure_public_dashboard(api: Api, uid: str) -> tuple[str, dict]:
-    """('created' | 'enabled' | 'unchanged', public dashboard config)."""
+    """('created' | 'unchanged' | 'paused', public dashboard config).
+
+    An existing public dashboard is never changed: one an admin paused (incident, leaked
+    link) stays paused across `docker compose up`; unpause it in the Grafana UI."""
     path = f"/api/dashboards/uid/{uid}/public-dashboards"
     status, current = api("GET", path, None)
     if status == 200 and current.get("accessToken"):
-        if current.get("isEnabled"):
-            return "unchanged", current
-        status, updated = api("PATCH", f"{path}/{current['uid']}", {"isEnabled": True})
-        if status != 200:
-            raise RuntimeError(f"enabling the public dashboard failed: HTTP {status} {updated}")
-        return "enabled", current | updated
+        return ("unchanged" if current.get("isEnabled") else "paused"), current
     if status not in (200, 404):
         raise RuntimeError(f"reading the public dashboard failed: HTTP {status} {current}")
     status, created = api("POST", path, dict(SETTINGS))
@@ -106,6 +104,8 @@ def main() -> int:
         print(f"publish_dashboard: {exc}", file=sys.stderr)
         return 1
     print(f"public dashboard {outcome}: {public}/public-dashboards/{config['accessToken']}")
+    if outcome == "paused":
+        print("publish_dashboard: the public dashboard is paused; left as it is", file=sys.stderr)
     return 0
 
 

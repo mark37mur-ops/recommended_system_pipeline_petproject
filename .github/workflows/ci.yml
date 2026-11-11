@@ -70,12 +70,13 @@ jobs:
           prom/prometheus:v3.15.1 check config /cfg/prometheus.yml
       - run: docker build -f docker/api.Dockerfile --build-arg GIT_SHA=${{ github.sha }} -t movielens-recsys-api:ci .
       - run: docker build -f docker/mlflow.Dockerfile -t movielens-recsys-mlflow:ci .
-      - name: API image imports the service and ships only the MLflow client
+      - name: API image imports the service, ships only the MLflow client and no Evidently
         run: >
           docker run --rm movielens-recsys-api:ci python -c
           "import importlib.metadata as m, recsys_api.main;
           names = {d.metadata['Name'].lower() for d in m.distributions()};
           assert 'mlflow' not in names, 'full mlflow in the API image';
+          assert 'evidently' not in names, 'evidently in the API image';
           print(sorted(n for n in names if n.startswith('mlflow')))"
       - name: API image can also train (lightgbm sklearn API needs scikit-learn)
         run: docker run --rm movielens-recsys-api:ci python -c "import lightgbm; lightgbm.LGBMRanker()"

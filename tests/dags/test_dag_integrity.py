@@ -59,6 +59,13 @@ def test_retrain_daily_has_the_spec_graph(dagbag):
     assert dag.task_dict["decide_promotion"].task_type.startswith("_BranchExternalPython")
 
 
+def test_retrain_daily_cleans_up_old_impressions_on_its_own(dagbag):
+    """Retention of recommendation_impressions (s5-review I-4): not in the training chain, so a
+    failed clean-up never blocks a retrain and a failed retrain never skips the clean-up."""
+    task = dagbag.dags["retrain_daily"].task_dict["cleanup_impressions"]
+    assert task.upstream_task_ids == set() and task.downstream_task_ids == set()
+
+
 def test_retrain_daily_params_render_as_python_objects(dagbag):
     """Without native rendering "{{ params.include_web }}" becomes the string "False"; recsys
     parses strings too (parse_flag), but the DAG should hand over real booleans."""

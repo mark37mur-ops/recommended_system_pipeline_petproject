@@ -337,3 +337,24 @@ def test_model_without_any_movie_to_validate_on_is_not_put_live():
         ready = client.get("/ready").json()
         assert ready["model"]["loaded"] is False
         assert "validate" in ready["model"]["last_error"]
+
+
+def test_recommendations_are_rate_limited_per_visitor():
+    """s5-review I-4: every response with a cookie writes impressions; a script must not be
+    able to call /recommendations without bound. Separate (generous) budget from ratings."""
+    with make_client(recommendations_rate_limit_per_minute=3, rate_limit_per_minute=100) as c:
+        assert [c.get("/recommendations").status_code for _ in range(3)] == [200] * 3
+        limited = c.get("/recommendations")
+        assert limited.status_code == 429 and limited.headers["retry-after"] == "60"
+        assert rate(c, 1).status_code == 200  # ratings have their own counter
+
+
+def test_recommendations_limit_is_off_while_redis_is_down():
+    store = FakeStore()
+    store.down = True
+    with make_client(store=store, recommendations_rate_limit_per_minute=1) as client:
+        assert [client.get("/recommendations").status_code for _ in range(5)] == [200] * 5
+
+
+def test_recommendations_limit_default_is_generous():
+    assert Settings(session_secret=SESSION_SECRET).recommendations_rate_limit_per_minute == 120

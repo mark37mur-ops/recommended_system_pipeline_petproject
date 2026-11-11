@@ -39,7 +39,7 @@ LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.
 PATHS = ("full", "cold_start", "fallback")
 CACHE_RESULTS = ("hit", "miss")
 SOURCES = ("web",)
-IMPRESSION_RESULTS = ("written", "dropped", "failed")
+IMPRESSION_RESULTS = ("written", "dropped", "failed", "deduplicated")
 UNMATCHED = "unmatched"
 # Scraped every 15 s / probed by healthchecks: logged at DEBUG, otherwise they drown the rest.
 QUIET_ENDPOINTS = frozenset({"/metrics", "/health"})
@@ -96,7 +96,8 @@ class ApiMetrics:
         )
         self.impressions = Counter(
             "recommendation_impressions_total",
-            "Impression rows: written to Postgres, dropped (queue full), failed (write error)",
+            "Impression rows: written to Postgres, dropped (queue full), failed (write error),"
+            " deduplicated (same pair shown again within the hour, not written)",
             ["result"],
             registry=r,
         )
@@ -110,6 +111,18 @@ class ApiMetrics:
             self.ratings_received.labels(source)
         for result in IMPRESSION_RESULTS:
             self.impressions.labels(result)
+        # No model yet (start-up, MLflow down): NaN, not the gauge default 0.0. `time() - 0`
+        # would read as a 56-year-old model and fire the model-age alert on every restart;
+        # the alert and panels drop NaN with a `> 0` filter ("no data").
+        self.model_loaded.set(float("nan"))
+        self.model_created.set(float("nan"))
+
+    def precreate_error_series(self, endpoints: Sequence[str]) -> None:
+        """Export `http_requests_total{endpoint, status="500"} 0` for every route: rate() needs
+        a sample before the increase, so a series born with its first error would hide that
+        error from the 5xx alert after every restart."""
+        for endpoint in endpoints:
+            self.http_requests.labels(endpoint, "500")
 
     def observe_request(self, endpoint: str, status: int, seconds: float) -> None:
         self.http_requests.labels(endpoint, str(status)).inc()

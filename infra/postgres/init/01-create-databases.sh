@@ -5,7 +5,8 @@
 #   airflow - Airflow metadata (stage 4). Compose always sets AIRFLOW_DB_PASSWORD (`:?`);
 #             the "skip when empty" branch below is only for running this script by hand.
 # plus one role without a database of its own:
-#   grafana_reader - Grafana's read-only view of `app` (stage 5). It may only connect to `app`,
+#   grafana_reader - Grafana's read-only view of `app` (stage 5). It may only connect to `app`
+#             (CONNECT and TEMPORARY are revoked from PUBLIC on app, mlflow and airflow),
 #             every transaction is read-only and every statement stops after 5 s (a heavy
 #             dashboard query cannot hurt the API). Which tables it may SELECT is decided by
 #             the app's schema code (recsys.db.schema.DASHBOARD_OBJECTS): those objects are
@@ -49,6 +50,19 @@ SELECT format('GRANT CONNECT ON DATABASE app TO %I', :'name') \gexec
 SQL
 }
 
+# Role defaults (read-only, timeout) can be overridden by the session itself; the real fence
+# is privileges. PUBLIC (every role) may by default CONNECT to every database and create
+# TEMPORARY tables: take that away, so the reader reaches only `app` (granted above) and
+# creates nothing there. The owners (app, mlflow, airflow) keep all rights on their own
+# databases. Idempotent, re-applied by db-init on every `docker compose up`.
+lock_down_public() {
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<'SQL'
+SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', datname)
+FROM pg_database WHERE datname IN ('app', 'mlflow', 'airflow') \gexec
+SQL
+}
+
 if [ -n "${GRAFANA_DB_PASSWORD:-}" ]; then
   create_reader grafana_reader "$GRAFANA_DB_PASSWORD"
 fi
+lock_down_public

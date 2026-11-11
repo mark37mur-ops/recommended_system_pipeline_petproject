@@ -1,6 +1,7 @@
 """Prometheus metrics of the API (spec 5.1): names, types, labels, bounded cardinality."""
 
 import logging
+import math
 
 import pytest
 from api_fakes import FakeChampion, FakeRepository, FakeStore, StubRecommender
@@ -252,3 +253,35 @@ def test_metrics_registry_is_reusable_directly():
         )
         == 1
     )
+
+
+# ----- review fixes (s5-review I-1, M-2) ---------------------------------------------------
+
+
+class FailingRegistry(Registry):
+    """MLflow unreachable: no model is ever loaded."""
+
+    def load(self):
+        raise ConnectionError("mlflow unreachable")
+
+
+def test_model_timestamps_are_not_exported_as_epoch_zero_before_a_model_loads():
+    """A gauge without a value would be exported as 0.0: `time() - 0` is ~56 years and fires
+    "model older than 36 h" on every API restart (or for as long as MLflow is down)."""
+    assert math.isnan(ApiMetrics().registry.get_sample_value("model_created_timestamp_seconds"))
+    assert math.isnan(ApiMetrics().registry.get_sample_value("model_loaded_timestamp_seconds"))
+    app, _ = make(registry=FailingRegistry())
+    with TestClient(app) as client:
+        metrics = scrape(client)
+    assert math.isnan(value(metrics, "model_created_timestamp_seconds"))
+    assert math.isnan(value(metrics, "model_loaded_timestamp_seconds"))
+
+
+def test_error_series_of_every_route_exist_before_the_first_error(app):
+    """rate() needs a sample before the increase: a 5xx series born with its first error
+    would hide that error from the 5xx alert."""
+    with TestClient(app) as client:
+        metrics = scrape(client)
+    total = "http_requests_total"
+    for endpoint in ("/recommendations", "/ratings", "/movies/search", "/ready"):
+        assert value(metrics, "http_requests", total, endpoint=endpoint, status="500") == 0

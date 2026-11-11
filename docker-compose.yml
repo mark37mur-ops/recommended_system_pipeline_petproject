@@ -189,6 +189,8 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       MODEL_RETRY_SECONDS: ${MODEL_RETRY_SECONDS:-30}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      # GET /recommendations per IP and per visitor (each answer writes impressions).
+      RECOMMENDATIONS_RATE_LIMIT_PER_MINUTE: ${RECOMMENDATIONS_RATE_LIMIT_PER_MINUTE:-120}
       # Proxies whose X-Forwarded-For uvicorn trusts (client IP for the rate limit). Stage 6:
       # set it to Caddy's address, otherwise every visitor shares Caddy's (or the Docker
       # gateway's) IP and thus one rate-limit bucket.

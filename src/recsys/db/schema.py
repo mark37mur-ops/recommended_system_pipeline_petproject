@@ -12,8 +12,11 @@ never collide with (or be mistaken for) a MovieLens user.
 The monitoring views are plain Postgres DDL hooked to `metadata` events, so `create_all`
 creates (or replaces) them after the tables and `drop_all` drops them first. Grafana reads the
 database as the read-only role DASHBOARD_READER (created by infra/postgres/init), which is
-granted SELECT on DASHBOARD_OBJECTS only: aggregates and metrics, not raw ratings and users.
+granted SELECT on DASHBOARD_OBJECTS only: aggregates and metrics, not raw ratings, users or
+per-pair impression outcomes.
 """
+
+from datetime import timedelta
 
 from sqlalchemy import (
     DDL,
@@ -157,16 +160,25 @@ run_metrics = Table(
 
 # Online quality (spec 5.2). The page refreshes recommendations after every rating, so a visitor
 # sees one movie many times: only the FIRST impression of a (user, movie) pair counts, otherwise
-# repeats would inflate the denominator. "Rated within an hour" means
+# repeats would inflate the denominator. "First" is per group of the metric, (path,
+# model_version): a pair first shown by the cold-start rule and later by the model counts for
+# the model too, and a new champion is judged on what it shows, not on what its predecessor
+# showed first (s5-review I-3). One rating can thus be a success of two groups; each group's
+# numbers are consistent on their own. "Rated within an hour" means
 # shown_at <= rated_at < shown_at + 1 hour. A later re-rating moves rated_at and can push the
 # pair out of the window (conservative).
-RECOMMENDATION_OUTCOMES_SQL = """
+# Only the last ONLINE_METRIC_WINDOW of impressions is read (index on shown_at; the DISTINCT ON
+# sorts that window, not the whole log: s5-review I-4). A pair shown before the window and
+# again inside it counts from its first impression inside the window.
+ONLINE_METRIC_WINDOW = timedelta(days=14)
+RECOMMENDATION_OUTCOMES_SQL = f"""
 CREATE OR REPLACE VIEW recommendation_outcomes AS
 WITH first_shown AS (
-    SELECT DISTINCT ON (user_id, movie_id)
+    SELECT DISTINCT ON (user_id, movie_id, path, model_version)
            user_id, movie_id, position, model_version, path, shown_at
     FROM recommendation_impressions
-    ORDER BY user_id, movie_id, shown_at, impression_id
+    WHERE shown_at > now() - INTERVAL '{ONLINE_METRIC_WINDOW.days} days'
+    ORDER BY user_id, movie_id, path, model_version, shown_at, impression_id
 )
 SELECT f.user_id, f.movie_id, f.position, f.model_version, f.path, f.shown_at,
        r.rating, r.rated_at,
@@ -175,6 +187,9 @@ SELECT f.user_id, f.movie_id, f.position, f.model_version, f.path, f.shown_at,
 FROM first_shown f
 LEFT JOIN ratings r ON r.user_id = f.user_id AND r.movie_id = f.movie_id
 """
+# Matured impressions only (shown more than an hour ago): a younger one has no final outcome
+# yet and would pull today's share down (s5-review M-1). Grafana reads this aggregate, never
+# the per-pair rows above (user_id, movie_id, rating: s5-review M-6).
 ONLINE_QUALITY_DAILY_SQL = """
 CREATE OR REPLACE VIEW online_quality_daily AS
 SELECT date_trunc('day', shown_at) AS day, path, model_version,
@@ -183,23 +198,26 @@ SELECT date_trunc('day', shown_at) AS day, path, model_version,
        avg(rated_within_hour::int)::double precision AS share_rated_within_hour,
        (avg(rating) FILTER (WHERE rated_within_hour))::double precision AS avg_rating
 FROM recommendation_outcomes
+WHERE shown_at <= now() - INTERVAL '1 hour'
 GROUP BY 1, 2, 3
 """
 MONITORING_VIEWS = ("online_quality_daily", "recommendation_outcomes")  # in drop order
 
 DASHBOARD_READER = "grafana_reader"
 DASHBOARD_OBJECTS = (
-    "recommendation_outcomes",
     "online_quality_daily",
     "drift_metrics",
     "run_metrics",
 )
+# Readable before the review (per-pair rows): taken back on every start, idempotently.
+DASHBOARD_REVOKED = ("recommendation_outcomes",)
 # Only if the role exists: infra/postgres/init creates it in compose; tests have no such role.
 GRANT_DASHBOARD_SQL = f"""
 DO $grant$
 BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = '{DASHBOARD_READER}') THEN
         GRANT SELECT ON {", ".join(DASHBOARD_OBJECTS)} TO {DASHBOARD_READER};
+        REVOKE ALL ON {", ".join(DASHBOARD_REVOKED)} FROM {DASHBOARD_READER};
     END IF;
 END
 $grant$

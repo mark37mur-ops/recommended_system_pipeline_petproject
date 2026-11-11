@@ -22,6 +22,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -32,7 +33,7 @@ from recsys.tracking import champion_version, load_champion
 from recsys_api.cache import KeyValueStore, RateLimiter, RecommendationCache, RedisStore
 from recsys_api.catalog import CatalogHolder
 from recsys_api.identity import COOKIE_NAME, CookieSigner
-from recsys_api.impressions import ImpressionLogger, ImpressionObserver
+from recsys_api.impressions import ImpressionLogger, ImpressionObserver, RecentImpressions
 from recsys_api.metrics import ApiMetrics, MetricsMiddleware, MetricsObserver
 from recsys_api.model import ModelHolder
 from recsys_api.observer import CompositeObserver, Observer
@@ -168,7 +169,8 @@ def create_app(
     )
     observers: list[Observer] = [MetricsObserver(metrics)]
     if impressions is not None:
-        observers.append(ImpressionObserver(impressions))
+        recent = RecentImpressions(window=settings.impressions_dedup_seconds)
+        observers.append(ImpressionObserver(impressions, recent=recent))
     if observer is not None:
         observers.append(observer)
     observer = CompositeObserver(observers)
@@ -192,6 +194,12 @@ def create_app(
         limiter=RateLimiter(store, limit=settings.rate_limit_per_minute),
         observer=observer,
         max_ratings=settings.max_ratings_per_user,
+    )
+    # Every response with a cookie writes impressions and may run an inference: a script must
+    # not call /recommendations without bound (s5-review I-4). Own counter, generous budget;
+    # like the ratings limiter it lets everything through while Redis is down (spec 3.5).
+    recommendations_limiter = RateLimiter(
+        store, limit=settings.recommendations_rate_limit_per_minute
     )
     if settings.session_secret is not None:
         secret = settings.session_secret.get_secret_value()
@@ -280,7 +288,15 @@ def create_app(
     def recommendations(
         request: Request, k: Annotated[int, Query(ge=1, le=MAX_K)] = 10
     ) -> RecommendationsOut:
-        rec = service.recommend(current_user(request), k)
+        user_id = current_user(request)
+        keys = [f"recs:ip:{client_ip(request)}"] + (
+            [f"recs:user:{user_id}"] if user_id is not None else []
+        )
+        if not recommendations_limiter.allow(keys):
+            raise HTTPException(
+                429, "too many requests, try again in a minute", headers={"Retry-After": "60"}
+            )
+        rec = service.recommend(user_id, k)
         current = catalog.current
         items = [MovieOut.of(current.get(m)) for m in rec.movie_ids if m in current]
         return RecommendationsOut(
@@ -348,4 +364,7 @@ def create_app(
         )
         return JSONResponse(body.model_dump(), status_code=RELOAD_STATUS_CODES[result.status])
 
+    metrics.precreate_error_series(
+        sorted({route.path for route in app.routes if isinstance(route, APIRoute)})
+    )
     return app
