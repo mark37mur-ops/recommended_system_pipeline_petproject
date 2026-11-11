@@ -21,6 +21,10 @@ dev = [
     "pytest>=9.2.0",
     "ruff>=0.17.4",
 ]
+notebooks = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.2",
+]
 
 [tool.ruff]
 line-length = 100
