@@ -18,9 +18,17 @@ def validate_ratings(
     for col, n in null_counts[null_counts > 0].items():
         problems.append(f"column '{col}' has {n} null values")
 
-    bad_ratings = int((~ratings["rating"].between(1, 5)).sum())
-    if bad_ratings:
-        problems.append(f"{bad_ratings} rows have rating outside 1..5")
+    rating = ratings["rating"]
+    if not pd.api.types.is_numeric_dtype(rating) or pd.api.types.is_bool_dtype(rating):
+        problems.append(f"column 'rating' is not numeric (dtype {rating.dtype})")
+    else:
+        present = rating.dropna()
+        bad_ratings = int((~present.between(1, 5)).sum())
+        if bad_ratings:
+            problems.append(f"{bad_ratings} rows have rating outside 1..5")
+        non_integer = int((present % 1 != 0).sum())
+        if non_integer:
+            problems.append(f"{non_integer} rows have non-integer rating")
 
     dups = int(ratings.duplicated(subset=["user_id", "movie_id"]).sum())
     if dups:

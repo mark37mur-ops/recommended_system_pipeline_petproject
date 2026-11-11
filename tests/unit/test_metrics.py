@@ -47,3 +47,15 @@ def test_evaluate_averages_and_missing_user_is_zero():
     assert res["ndcg_at_10"] == pytest.approx(0.5)  # (1.0 + 0.0) / 2
     assert res["recall_at_10"] == pytest.approx(0.5)
     assert res["coverage"] == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize("fn", [ndcg_at_k, recall_at_k])
+def test_k_below_one_raises(fn):
+    with pytest.raises(ValueError, match="k must be >= 1"):
+        fn([1], {1}, k=0)
+
+
+def test_evaluate_k_below_one_raises():
+    test = pd.DataFrame({"user_id": [1], "movie_id": [10]})
+    with pytest.raises(ValueError, match="k must be >= 1"):
+        evaluate({1: [10]}, test, n_items=100, k=0)

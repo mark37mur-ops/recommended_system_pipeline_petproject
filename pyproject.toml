@@ -7,9 +7,14 @@ authors = [
 ]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "implicit>=0.7.3",
+    "lightgbm>=4.7.0",
+    "mlflow>=3.18.0",
     "numpy>=2.5.4",
     "pandas>=3.1.1",
     "pyarrow>=26.0.1",
+    "scipy>=1.18.1",
+    "threadpoolctl>=3.8.0",
 ]
 
 [build-system]
