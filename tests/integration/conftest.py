@@ -42,7 +42,12 @@ def engine():
 def db(engine):
     """Empty tables (and a fresh web-id sequence) for every test."""
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE ratings, users, movies, retrain_runs"))
+        conn.execute(
+            text(
+                "TRUNCATE ratings, users, movies, retrain_runs, recommendation_impressions, "
+                "drift_metrics, run_metrics"
+            )
+        )
         conn.execute(text("ALTER SEQUENCE web_user_id_seq RESTART"))
     return engine
 

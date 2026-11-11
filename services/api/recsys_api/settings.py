@@ -1,6 +1,7 @@
 """Service configuration from environment variables (`.env` in compose, see `.env.example`)."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -34,6 +35,11 @@ class Settings(BaseSettings):
     onboarding_size: int = 20
     model_retry_seconds: float = 30.0  # startup: retry MLflow / Postgres this often
     log_level: str = "INFO"
+    # json: one JSON object per line on stdout (spec 5.6, what Docker collects); text: humans.
+    log_format: Literal["json", "text"] = "json"
+    # Write every shown recommendation to recommendation_impressions (spec 5.2), off the
+    # request path. Off: no rows, no online metric.
+    impressions_enabled: bool = True
 
     @field_validator("admin_token", "session_secret", mode="before")
     @classmethod
