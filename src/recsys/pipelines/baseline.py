@@ -3,30 +3,29 @@
 import argparse
 from pathlib import Path
 
-import pandas as pd
-
 from recsys.data.movielens import load_movies, load_ratings
 from recsys.data.split import Split, temporal_split
 from recsys.data.validate import validate_ratings
-from recsys.metrics import evaluate
+from recsys.evaluation import (
+    EvalContext,
+    build_history,
+    evaluate_recommendations,
+    make_test_context,
+)
 from recsys.models.popularity import PopularityRecommender
 
+__all__ = ["build_history", "popularity_model", "recommend_for_test_users", "run_baseline"]
 
-def build_history(split: Split) -> tuple[pd.DataFrame, dict[int, set[int]]]:
-    """History visible to the model (als_train + ranker_train) and per-user seen movie sets."""
-    history = pd.concat([split.als_train, split.ranker_train], ignore_index=True)
-    seen = {
-        int(user): {int(m) for m in group["movie_id"]} for user, group in history.groupby("user_id")
-    }
-    return history, seen
+
+def popularity_model(ctx: EvalContext) -> dict[int, list[int]]:
+    """Fit popularity on the context history and recommend k unseen movies to every user."""
+    model = PopularityRecommender().fit(ctx.history)
+    return model.recommend_batch(ctx.users, ctx.seen, k=ctx.k)
 
 
 def recommend_for_test_users(split: Split, k: int = 10) -> dict[int, list[int]]:
-    """Fit popularity on the history only and recommend k unseen movies to every test user."""
-    history, seen = build_history(split)
-    model = PopularityRecommender().fit(history)
-    test_users = sorted(int(u) for u in split.test["user_id"].unique())
-    return model.recommend_batch(test_users, seen, k=k)
+    """Popularity recommendations for the test users, under the shared test protocol."""
+    return popularity_model(make_test_context(split, n_items=1, k=k))
 
 
 def run_baseline(raw_dir: Path, k: int = 10) -> dict[str, float]:
@@ -34,9 +33,8 @@ def run_baseline(raw_dir: Path, k: int = 10) -> dict[str, float]:
     movies = load_movies(raw_dir)
     validate_ratings(ratings)
 
-    split = temporal_split(ratings)
-    recommendations = recommend_for_test_users(split, k=k)
-    return evaluate(recommendations, split.test, n_items=len(movies), k=k)
+    ctx = make_test_context(temporal_split(ratings), n_items=len(movies), k=k)
+    return evaluate_recommendations(popularity_model(ctx), ctx)
 
 
 def positive_int(value: str) -> int:
