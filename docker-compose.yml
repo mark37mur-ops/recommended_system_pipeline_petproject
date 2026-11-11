@@ -1,0 +1,171 @@
+# Local stack (spec 1, 6.2): Postgres (app + mlflow DBs), Redis, MLflow server, API.
+#   cp .env.example .env   # and replace every change-me (the API refuses to start with them)
+#   docker compose up -d --build
+#   docker compose --profile tools run --rm loader    # MovieLens 1M -> Postgres (idempotent)
+#   docker compose --profile tools run --rm trainer   # train + register champion on MLflow
+#   curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/admin/reload-model
+# Every port is published on 127.0.0.1 of the host only (MLflow has no auth of its own; the
+# API is reached from other machines through Caddy in docker-compose.prod.yml, stage 6).
+# Stage 4 adds Airflow (its database
+# is created by the Postgres init script when AIRFLOW_DB_PASSWORD is set), stage 5
+# Prometheus + Grafana, stage 6 Caddy in docker-compose.prod.yml.
+name: movielens-recsys
+
+x-api-image: &api-image
+  image: movielens-recsys-api:local
+  build:
+    context: .
+    dockerfile: docker/api.Dockerfile
+    args:
+      GIT_SHA: ${GIT_SHA:-unknown}
+
+x-app-db: &app-db
+  DATABASE_URL: postgresql+psycopg://app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@postgres:5432/app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:?set MLFLOW_DB_PASSWORD in .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:-}  # stage 4
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      # Over TCP: during the first-start init the entrypoint runs a temporary server that
+      # listens on the unix socket only, so this passes only once init is done.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # Pure cache + rate-limit counters: no persistence, bounded memory.
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow:
+    image: movielens-recsys-mlflow:local
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    restart: unless-stopped
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=1
+      - --backend-store-uri=postgresql+psycopg://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
+      - --serve-artifacts
+      - --artifacts-destination=/mlartifacts
+      # Host header check (DNS-rebinding protection): the API/trainer call it as mlflow:5000,
+      # the browser via an SSH tunnel as localhost:5000.
+      - --allowed-hosts=mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
+    environment:
+      # MLflow 3.18 starts ~9 background job processes (GenAI scorers) by default, ~2 GB RSS;
+      # tracking + registry do not need them.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+    volumes:
+      - mlartifacts:/mlartifacts
+    ports:
+      - "127.0.0.1:${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+
+  api:
+    <<: *api-image
+    restart: unless-stopped
+    environment:
+      <<: *app-db
+      REDIS_URL: redis://redis:6379/0
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      # Fail a reload in seconds instead of retrying for minutes (MLflow client default).
+      MLFLOW_HTTP_REQUEST_MAX_RETRIES: "1"
+      MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR: "1"
+      MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MODEL_RETRY_SECONDS: ${MODEL_RETRY_SECONDS:-30}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      # Proxies whose X-Forwarded-For uvicorn trusts (client IP for the rate limit). Stage 6:
+      # set it to Caddy's address, otherwise every visitor shares Caddy's (or the Docker
+      # gateway's) IP and thus one rate-limit bucket.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Not "healthy": the API starts without MLflow (popularity fallback) and retries.
+      mlflow:
+        condition: service_started
+    healthcheck:
+      # Liveness only; /ready reports degradation (no model, no database) separately.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  # ----- one-off jobs (docker compose --profile tools run --rm <name>) -------------------
+  loader:
+    <<: *api-image
+    profiles: ["tools"]
+    command: ["python", "-m", "recsys.db.load_movielens",
+              "--data-dir", "/data/raw/ml-1m", "--download"]
+    environment:
+      <<: *app-db
+    volumes:
+      - movielens:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  trainer:
+    <<: *api-image
+    profiles: ["tools"]
+    # Stage 3 trains on the raw MovieLens files; stage 4's DAG extracts ratings (incl. web)
+    # from Postgres instead. The model is registered on the MLflow server, artifacts are
+    # uploaded over HTTP (mlflow-artifacts:/), so no volume is shared with MLflow.
+    command: ["python", "-m", "recsys.pipelines.train",
+              "--data-dir", "/data/raw/ml-1m", "--tmp-dir", "/tmp/recsys"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - movielens:/data:ro
+    depends_on:
+      mlflow:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  mlartifacts:
+  movielens:  # ml-1m.zip + extracted files, filled by `loader --download`

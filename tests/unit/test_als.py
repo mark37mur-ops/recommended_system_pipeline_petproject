@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from synthetic import make_ratings, taste_of_movie, taste_of_user
+from threadpoolctl import threadpool_info
 
 from recsys.models.als import (
     CANDIDATE_COLUMNS,
@@ -137,3 +138,39 @@ def test_fit_duplicate_rows_keep_last_instead_of_summing(ratings):
     duplicated = ALSCandidateGenerator(CONFIG).fit(_with_stale_duplicates(ratings[cols]))
     assert duplicated._user_items is not None and clean._user_items is not None
     assert (duplicated._user_items != clean._user_items).nnz == 0
+
+
+def test_pin_blas_threads_skips_per_call_limits(monkeypatch):
+    """Per-call threadpool_limits changes a process-wide setting and races between request
+    threads; once BLAS is pinned for the process, ALS calls must not touch it again."""
+    import recsys.models.als as als_module
+
+    ratings = make_ratings()
+    model = ALSCandidateGenerator(ALSConfig(factors=4, iterations=3, num_threads=1)).fit(ratings)
+    visitor = pd.DataFrame({"user_id": [0, 0], "movie_id": [3, 6], "rating": [5, 4]})
+    calls = []
+    real = als_module.threadpool_limits
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    before = {p["filepath"]: p["num_threads"] for p in threadpool_info()}
+    monkeypatch.setattr(als_module, "_BLAS_PINNED", False)
+    monkeypatch.setattr(als_module, "_BLAS_LIMITER", None)
+    monkeypatch.setattr(als_module, "threadpool_limits", spy)
+    model.candidates_for_ratings(visitor, n=5)
+    assert calls, "without pinning every call limits BLAS itself"
+
+    calls.clear()
+    als_module.pin_blas_threads()
+    try:
+        model.candidates_for_ratings(visitor, n=5)
+        model.candidates([1, 2], n=5)
+        assert calls == []
+        blas = [p for p in threadpool_info() if p["user_api"] == "blas"]
+        assert all(p["num_threads"] == 1 for p in blas)
+    finally:
+        # The pin is process-wide: undo it so later tests see the thread pools they had.
+        als_module._BLAS_LIMITER.restore_original_limits()
+    assert {p["filepath"]: p["num_threads"] for p in threadpool_info()} == before

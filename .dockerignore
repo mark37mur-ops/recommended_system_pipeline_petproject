@@ -1,0 +1,15 @@
+# Build context = repo root; only pyproject/uv.lock, src/ and services/ are needed.
+.git
+.venv
+.github
+.superpowers
+.pytest_cache
+.ruff_cache
+.model-cache
+**/__pycache__
+data
+mlruns
+notebooks
+docs
+tests
+.env

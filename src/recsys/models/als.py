@@ -6,7 +6,8 @@ keeps the mapping to `user_id` / `movie_id` and always talks in real ids.
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Self
@@ -16,11 +17,36 @@ import pandas as pd
 import scipy.sparse as sp
 from implicit.cpu.als import AlternatingLeastSquares
 from numpy.typing import ArrayLike
-from threadpoolctl import threadpool_limits
+from threadpoolctl import ThreadpoolController, threadpool_limits
 
 RATING_WEIGHTS = ("linear", "binary")
 CANDIDATE_COLUMNS = ["user_id", "movie_id", "als_score", "als_rank"]
 _FILTERED_SCORE = np.finfo(np.float32).min / 2
+
+# `implicit` wants BLAS single-threaded (its own OpenMP loops parallelise; nested BLAS threads
+# only oversubscribe the CPU and make results less reproducible). Training scripts limit BLAS
+# around each call. A long-lived multi-threaded process (the API) pins it once instead: a
+# per-call `threadpool_limits` changes process-wide state on enter and restores it on exit, so
+# concurrent request threads would keep flipping each other's setting.
+_BLAS_PINNED = False
+_BLAS_LIMITER = None
+
+
+def pin_blas_threads() -> None:
+    """Limit BLAS to one thread for the rest of the process; afterwards ALS calls no longer
+    wrap themselves in `threadpool_limits`. Idempotent."""
+    global _BLAS_PINNED, _BLAS_LIMITER
+    _BLAS_LIMITER = ThreadpoolController().limit(limits=1, user_api="blas")  # kept, not exited
+    _BLAS_PINNED = True
+
+
+@contextmanager
+def _single_blas_thread() -> Iterator[None]:
+    if _BLAS_PINNED:
+        yield
+        return
+    with threadpool_limits(1, "blas"):
+        yield
 
 
 def confidence_weights(ratings: ArrayLike, scheme: str = "linear") -> np.ndarray:
@@ -87,14 +113,14 @@ class ALSCandidateGenerator:
             (data, (rows, cols)), shape=(len(self._user_ids), len(self._movie_ids))
         )
         self._model = self._new_model()
-        with threadpool_limits(1, "blas"):
+        with _single_blas_thread():
             self._model.fit(self._user_items, show_progress=False)
         self.n_train_ratings = len(ratings)
         return self
 
     def _new_model(self) -> AlternatingLeastSquares:
         c = self.config
-        with threadpool_limits(1, "blas"):
+        with _single_blas_thread():
             return AlternatingLeastSquares(
                 factors=c.factors,
                 regularization=c.regularization,
@@ -136,7 +162,7 @@ class ALSCandidateGenerator:
             return _empty_candidates()
         rows = np.searchsorted(self._user_ids, users)
         assert self._user_items is not None
-        with threadpool_limits(1, "blas"):
+        with _single_blas_thread():
             ids, scores = self.model.recommend(
                 rows, self._user_items[rows], N=self._n(n), filter_already_liked_items=True
             )
@@ -161,7 +187,7 @@ class ALSCandidateGenerator:
         matrix = sp.csr_matrix((data, (rows, col[known])), shape=(len(users), len(self._movie_ids)))
         has_known = np.diff(matrix.indptr) > 0
         users, matrix = users[has_known], matrix[has_known]
-        with threadpool_limits(1, "blas"):
+        with _single_blas_thread():
             ids, scores = self.model.recommend(
                 np.arange(len(users)),
                 matrix,
@@ -214,7 +240,7 @@ class ALSCandidateGenerator:
         path = Path(path)
         meta = json.loads((path / "als_meta.json").read_text(encoding="utf-8"))
         obj = cls(ALSConfig(**meta["config"]))
-        with threadpool_limits(1, "blas"):
+        with _single_blas_thread():
             obj._model = AlternatingLeastSquares.load(str(path / "als_model.npz"))
         with np.load(path / "als_index.npz") as index:
             obj._user_ids = index["user_ids"]

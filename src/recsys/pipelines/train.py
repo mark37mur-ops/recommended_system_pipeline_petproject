@@ -352,6 +352,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-name", default=MODEL_NAME)
     parser.add_argument("--sweep", action="store_true", help="pick ALS params on validation")
     parser.add_argument("--no-register", action="store_true")
+    parser.add_argument(
+        "--tmp-dir",
+        type=Path,
+        default=Path("mlruns") / "tmp",
+        help="scratch space for model bundles before upload (default: ./mlruns/tmp)",
+    )
     parser.add_argument("--k", type=positive_int, default=10)
     parser.add_argument("--n-candidates", type=positive_int, default=100)
     parser.add_argument("--factors", type=positive_int, default=defaults.factors)
@@ -380,7 +386,7 @@ def main(argv: Sequence[str] | None = None) -> TrainingRun:
         model_name=args.model_name,
         sweep_grid=DEFAULT_SWEEP_GRID if args.sweep else None,
         register=not args.no_register,
-        tmp_root=Path("mlruns") / "tmp",
+        tmp_root=args.tmp_dir,
     )
 
 
