@@ -62,3 +62,21 @@ def test_all_problems_reported_together():
     problems = _problems(df)
     assert any("null" in p for p in problems)
     assert any("duplicate" in p for p in problems)
+
+
+def test_non_integer_rating_rejected():
+    df = _make().astype({"rating": "float64"})
+    df.loc[0, "rating"] = 3.5
+    assert any("non-integer" in p for p in _problems(df))
+
+
+def test_integer_valued_float_ratings_pass():
+    df = _make().astype({"rating": "float64"})
+    df["rating"] = np.tile([1.0, 2.0, 3.0, 4.0, 5.0], 20)
+    validate_ratings(df)
+
+
+def test_non_numeric_rating_reported():
+    df = _make().astype({"rating": "object"})
+    df.loc[0, "rating"] = "5"
+    assert any("not numeric" in p for p in _problems(df))

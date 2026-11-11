@@ -6,6 +6,11 @@ from collections.abc import Mapping, Sequence
 import pandas as pd
 
 
+def _check_k(k: int) -> None:
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+
+
 def _top_unique(recommended: Sequence[int], k: int) -> list[int]:
     """First k recommendations, with repeats collapsed to their first occurrence."""
     return list(dict.fromkeys(recommended[:k]))
@@ -15,8 +20,9 @@ def ndcg_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> fl
     """NDCG@k with binary relevance.
 
     `recommended` is truncated to k first, then de-duplicated (first occurrence counts).
-    Returns 0.0 when `relevant` is empty.
+    Returns 0.0 when `relevant` is empty. Raises ValueError when k < 1.
     """
+    _check_k(k)
     if not relevant:
         return 0.0
     dcg = sum(
@@ -32,6 +38,7 @@ def ndcg_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> fl
 
 def recall_at_k(recommended: Sequence[int], relevant: set[int], k: int = 10) -> float:
     """Recall@k: hits among the top-k (truncated first, then de-duplicated) over |relevant|."""
+    _check_k(k)
     if not relevant:
         return 0.0
     hits = sum(1 for item in _top_unique(recommended, k) if item in relevant)
@@ -58,7 +65,9 @@ def evaluate(
     (truncated to k) over users present in `test`, divided by n_items.
 
     Keys are MLflow-compatible (no "@"): ndcg_at_{k}, recall_at_{k}, coverage.
+    Raises ValueError when k < 1.
     """
+    _check_k(k)
     relevant_by_user = test.groupby("user_id")["movie_id"].agg(set).to_dict()
 
     ndcgs: list[float] = []

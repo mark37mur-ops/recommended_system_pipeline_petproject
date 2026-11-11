@@ -1,10 +1,16 @@
+import sys
 from pathlib import Path
 
 import pytest
 
 from recsys.data.movielens import load_ratings
 from recsys.data.split import temporal_split
-from recsys.pipelines.baseline import build_history, recommend_for_test_users, run_baseline
+from recsys.pipelines.baseline import (
+    build_history,
+    main,
+    recommend_for_test_users,
+    run_baseline,
+)
 
 N_USERS = 30
 N_RATINGS = 20
@@ -63,3 +69,11 @@ def test_history_contains_no_test_ratings(raw_dir):
 
 def test_run_baseline_is_deterministic(raw_dir):
     assert run_baseline(raw_dir) == run_baseline(raw_dir)
+
+
+@pytest.mark.parametrize("bad_k", ["0", "-3", "abc"])
+def test_cli_rejects_non_positive_k(raw_dir, monkeypatch, bad_k):
+    monkeypatch.setattr(sys, "argv", ["baseline", "--data-dir", str(raw_dir), "--k", bad_k])
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+    assert exc_info.value.code == 2

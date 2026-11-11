@@ -39,10 +39,21 @@ def run_baseline(raw_dir: Path, k: int = 10) -> dict[str, float]:
     return evaluate(recommendations, split.test, n_items=len(movies), k=k)
 
 
+def positive_int(value: str) -> int:
+    """argparse type: an integer >= 1."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate the popularity baseline.")
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--k", type=positive_int, default=10)
     args = parser.parse_args()
     for name, value in run_baseline(args.data_dir, k=args.k).items():
         print(f"{name}: {value:.4f}")
