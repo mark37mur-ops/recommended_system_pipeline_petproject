@@ -39,6 +39,9 @@ class FakeRepository:
     def ping(self) -> None:
         self._check("ping")
 
+    def ensure_schema(self) -> None:
+        self._check("ensure_schema")
+
     def load_movies(self) -> list[Movie]:
         self._check("load_movies")
         return list(self.movies)
@@ -103,8 +106,8 @@ class FakeStore:
         return out
 
     def ping(self) -> bool:
-        self._check()
-        return True
+        self.calls += 1
+        return not self.down
 
 
 class StubRecommender:
