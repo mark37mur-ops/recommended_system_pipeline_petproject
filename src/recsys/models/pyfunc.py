@@ -4,7 +4,7 @@ The model is logged "from code" (`pyfunc_entry.py`), so no pickled Python object
 the bundle directory (ALS, ranker, feature tables) is an MLflow artifact, and the loading
 environment must have the `recsys` package installed (the API image does).
 
-`predict` input: ratings DataFrame (user_id, movie_id, rating), one or many users; params
+`predict` input: ratings DataFrame (user_id, movie_id, integer rating), one or many users; params
 `{"k": 10}`. Output: RECOMMENDATION_COLUMNS (user_id, rank, movie_id, score), produced by
 fold-in on the given ratings, i.e. the same path the API uses for a web visitor.
 """
@@ -25,7 +25,7 @@ ENTRY_POINT = Path(__file__).with_name("pyfunc_entry.py")
 BUNDLE_ARTIFACT = "bundle"
 SIGNATURE = ModelSignature(
     inputs=Schema(
-        [ColSpec("long", "user_id"), ColSpec("long", "movie_id"), ColSpec("double", "rating")]
+        [ColSpec("long", "user_id"), ColSpec("long", "movie_id"), ColSpec("long", "rating")]
     ),
     outputs=Schema(
         [
@@ -52,6 +52,7 @@ class RecommenderPyfunc(mlflow.pyfunc.PythonModel):
             raise RuntimeError("model context is not loaded")
         k = int((params or {}).get("k", 10))
         ratings = pd.DataFrame(model_input)[["user_id", "movie_id", "rating"]]
+        ratings = ratings.astype({"user_id": "int64", "movie_id": "int64", "rating": "int64"})
         out = self.recommender.recommend_for_ratings(ratings, k=k)
         return out.astype({"user_id": "int64", "rank": "int64", "movie_id": "int64"})[
             RECOMMENDATION_COLUMNS
@@ -76,7 +77,7 @@ def log_recommender(
             {
                 "user_id": [0, 0, 0],
                 "movie_id": recommender.als.movie_ids[:3].astype("int64"),
-                "rating": [5.0, 4.0, 3.0],
+                "rating": [5, 4, 3],
             }
         )
         return mlflow.pyfunc.log_model(

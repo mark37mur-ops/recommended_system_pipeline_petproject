@@ -109,7 +109,7 @@ def test_recommend_for_ratings_output_schema(recommender, data):
         assert group["score"].is_monotonic_decreasing
 
 
-def test_fold_in_and_batch_paths_build_identical_features(recommender, data):
+def test_serving_user_features_reproduce_batch_features(recommender, data):
     _, _, users, _, history, _ = data
     user = 7
     own = history[history["user_id"] == user]
@@ -134,3 +134,19 @@ def test_save_load_roundtrip_same_recommendations(recommender, tmp_path, with_ra
     assert loaded.recommend_new_user(rated) == model.recommend_new_user(rated)
     pd.testing.assert_frame_equal(loaded.movie_feats, model.movie_feats)
     np.testing.assert_array_equal(loaded.user_feats.index, model.user_feats.index)
+
+
+def test_fold_in_matches_fitted_path_for_training_users(recommender, data):
+    """Serving a known user through fold-in on their own history must give (nearly) the
+    recommendations of the fitted-factor path used in offline evaluation."""
+    _, _, users, _, history, _ = data
+    user_ids = list(range(1, 61))
+    fitted = recommender.recommend_known_users(user_ids, k=10)
+    own = history[history["user_id"].isin(user_ids)]
+    folded = TwoStageRecommender._as_dict(
+        recommender.recommend_for_ratings(own, k=10, profiles=users), user_ids
+    )
+    overlaps = [len(set(fitted[u]) & set(folded[u])) / 10 for u in user_ids]
+    assert float(np.mean(overlaps)) >= 0.7, overlaps
+    for u in user_ids:
+        assert not set(folded[u]) & set(history.loc[history["user_id"] == u, "movie_id"])

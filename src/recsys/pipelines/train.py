@@ -79,6 +79,20 @@ def _candidate_lists(candidates: pd.DataFrame) -> dict[int, list[int]]:
     }
 
 
+def _foldin_ndcg(
+    recommender: TwoStageRecommender, ctx: EvalContext, users: pd.DataFrame | None
+) -> float:
+    """NDCG@k of the serving path: the test users' history is fed through fold-in (factors
+    recomputed from their ratings) instead of the fitted ALS factors. Reported next to the
+    main metrics so a drift between the two paths shows up in every run."""
+    wanted = set(ctx.users)
+    own = ctx.history[ctx.history["user_id"].isin(wanted)]
+    profiles = None if users is None else users[users["user_id"].isin(wanted)]
+    ranked = recommender.recommend_for_ratings(own, k=ctx.k, profiles=profiles)
+    lists = TwoStageRecommender._as_dict(ranked, ctx.users)
+    return evaluate_recommendations(lists, ctx)[f"ndcg_at_{ctx.k}"]
+
+
 def validate_als(
     split: Split, n_items: int, als_config: ALSConfig, k: int = 10, n_candidates: int = 100
 ) -> dict[str, float]:
@@ -163,6 +177,8 @@ def train_and_evaluate(
     }
     metrics = compare_models(models, ctx)
     variant = select_variant(metrics, k=config.k)
+    served = full if variant == "als_ranker" else als_only
+    diagnostics[f"{variant}_foldin_ndcg_at_{config.k}"] = _foldin_ndcg(served, ctx, users)
     diagnostics |= {
         "eval_als_n_ratings": float(als.n_train_ratings),
         "n_als_train": float(len(split.als_train)),
@@ -173,7 +189,7 @@ def train_and_evaluate(
     return TrainResult(
         metrics=metrics,
         variant=variant,
-        recommender=full if variant == "als_ranker" else als_only,
+        recommender=served,
         diagnostics=diagnostics,
         feature_importance=ranker.feature_importance(),
     )
@@ -254,7 +270,8 @@ def run_training(
         "data_snapshot": snapshot,
         "n_users": str(ratings["user_id"].nunique()),
         "n_ratings": str(len(ratings)),
-        "web_share": "0.0",  # MovieLens only until web ratings arrive (stage 3)
+        # TODO: stays 0.0 until the ratings table gets a `source` column (web vs MovieLens).
+        "web_share": "0.0",
     }
     if tmp_root is not None:
         Path(tmp_root).mkdir(parents=True, exist_ok=True)
@@ -313,6 +330,7 @@ def run_training(
             tags={"variant": result.variant, "git_sha": data_tags["git_sha"]},
             name=model_name,
             k=k,
+            beats_popularity=beats_popularity,
         )
         verdict = "promoted to champion" if registration.promoted else "not promoted"
         echo(f"registered {model_name} v{registration.version}: {verdict} ({registration.reason})")

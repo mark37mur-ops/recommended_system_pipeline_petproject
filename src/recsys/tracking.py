@@ -65,7 +65,8 @@ def _git(*args: str) -> str | None:
 
 
 def git_sha() -> str:
-    return _git("rev-parse", "HEAD") or "unknown"
+    """`$GIT_SHA` (set when building Docker images, which have no .git) > git HEAD > unknown."""
+    return os.environ.get("GIT_SHA") or _git("rev-parse", "HEAD") or "unknown"
 
 
 def git_dirty() -> bool:
@@ -74,9 +75,14 @@ def git_dirty() -> bool:
 
 
 def data_snapshot_hash(ratings: pd.DataFrame) -> str:
-    """Content hash of the ratings table, independent of row order."""
+    """Content hash of the ratings table, independent of row order and column dtypes."""
     cols = ["user_id", "movie_id", "rating", "timestamp"]
-    canonical = ratings[cols].sort_values(cols[:2], kind="stable").reset_index(drop=True)
+    canonical = (
+        ratings[cols]
+        .astype("int64")  # int8 / int32 / integral floats all hash alike
+        .sort_values(cols, kind="stable")
+        .reset_index(drop=True)
+    )
     hashed = pd.util.hash_pandas_object(canonical, index=False).to_numpy()
     return hashlib.sha256(hashed.tobytes()).hexdigest()[:16]
 
@@ -87,9 +93,15 @@ def decide_promotion(
     ndcg_tolerance: float = NDCG_TOLERANCE,
     max_coverage_drop: float = MAX_COVERAGE_DROP,
     k: int = 10,
+    beats_popularity: bool = True,
 ) -> tuple[bool, str]:
     """Spec 4.2: promote if there is no champion, or NDCG@k(challenger) >= NDCG@k(champion) -
-    tolerance and coverage dropped by at most `max_coverage_drop` (relative)."""
+    tolerance and coverage dropped by at most `max_coverage_drop` (relative).
+
+    Spec 2.5 gate first: a model that does not beat the popularity baseline is never promoted,
+    whatever the champion situation."""
+    if not beats_popularity:
+        return False, "does not beat the popularity baseline (spec 2.5)"
     if champion is None:
         return True, "no current champion"
     key = f"ndcg_at_{k}"
@@ -129,6 +141,7 @@ def register_and_promote(
     tags: Mapping[str, str] | None = None,
     name: str = MODEL_NAME,
     k: int = 10,
+    beats_popularity: bool = True,
 ) -> RegistrationOutcome:
     """Register `model_uri` as a new version of `name` and move `champion` if it deserves it.
 
@@ -136,17 +149,21 @@ def register_and_promote(
     it was evaluated on the same data snapshot (same deterministic split); otherwise the alias
     is left alone and re-evaluating the champion on the new split is left to the retraining
     DAG (stage 4). Champion metrics are also logged into `run_id` as champion_*.
+    `beats_popularity=False` (spec 2.5 gate) registers the version but never promotes it.
     """
     client = MlflowClient()
     champion = _current_champion(client, name)
     version = mlflow.register_model(model_uri, name).version
     version_tags = {f"metric.{key}": f"{value:.6f}" for key, value in metrics.items()}
     version_tags |= {"data_snapshot": snapshot, **(tags or {})}
+    version_tags["beats_popularity"] = str(beats_popularity).lower()
     for key, value in version_tags.items():
         client.set_model_version_tag(name, version, key, value)
 
     champion_metrics = None
-    if champion is None:
+    if not beats_popularity:
+        promoted, reason = decide_promotion(metrics, None, k=k, beats_popularity=False)
+    elif champion is None:
         promoted, reason = decide_promotion(metrics, None, k=k)
     elif champion.tags.get("data_snapshot") != snapshot:
         promoted = False
@@ -189,10 +206,14 @@ class ChampionModel:
 
 
 def load_champion(tracking_uri: str | None = None, name: str = MODEL_NAME) -> ChampionModel:
-    """Load the `champion` version of the registered model (what the API serves)."""
+    """Load the `champion` version of the registered model (what the API serves).
+
+    The alias is resolved exactly once and the weights are loaded by that version number, so a
+    promotion happening meanwhile cannot make `version` and the loaded model disagree.
+    """
     mlflow.set_tracking_uri(resolve_tracking_uri(tracking_uri))
     model_version = MlflowClient().get_model_version_by_alias(name, CHAMPION_ALIAS)
-    model_uri = f"models:/{name}@{CHAMPION_ALIAS}"
+    model_uri = f"models:/{name}/{model_version.version}"
     pyfunc_model = mlflow.pyfunc.load_model(model_uri)
     recommender = pyfunc_model.unwrap_python_model().recommender
     return ChampionModel(
