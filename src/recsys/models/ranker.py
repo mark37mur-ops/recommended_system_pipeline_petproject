@@ -13,7 +13,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from recsys.features import CATEGORICAL_FEATURES, FEATURE_COLUMNS, build_feature_frame
+from recsys.features import FEATURE_COLUMNS, build_feature_frame
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,8 @@ class RankerConfig:
     num_leaves: int = 31
     min_child_samples: int = 50
     colsample_bytree: float = 0.8
-    early_stopping_rounds: int = 30
-    valid_fraction: float = 0.1
+    early_stopping_rounds: int = 50
+    valid_fraction: float = 0.2
     demographics_dropout: float = 0.1
     random_state: int = 42
     n_jobs: int = 0
@@ -69,6 +69,7 @@ class LambdaRanker:
         self.config = config
         self._booster: lgb.Booster | None = None
         self.best_iteration = 0
+        self.valid_ndcg: float | None = None  # NDCG@10 on the held-out users, if any
 
     def fit(self, frame: pd.DataFrame) -> Self:
         """Train on a frame from `build_training_frame` (user_id, FEATURE_COLUMNS, label).
@@ -98,10 +99,7 @@ class LambdaRanker:
             importance_type="gain",
             verbose=-1,
         )
-        fit_kwargs: dict = {
-            "group": _groups(train),
-            "categorical_feature": CATEGORICAL_FEATURES,
-        }
+        fit_kwargs: dict = {"group": _groups(train)}
         if len(valid):
             fit_kwargs |= {
                 "eval_X": (valid[FEATURE_COLUMNS],),
@@ -113,6 +111,8 @@ class LambdaRanker:
         model.fit(train[FEATURE_COLUMNS], train["label"], **fit_kwargs)
         self._booster = model.booster_
         self.best_iteration = int(model.best_iteration_ or c.n_estimators)
+        if len(valid):
+            self.valid_ndcg = float(model.best_score_["valid_0"]["ndcg@10"])
         return self
 
     @property
@@ -136,6 +136,7 @@ class LambdaRanker:
         meta = {
             "config": asdict(self.config),
             "best_iteration": self.best_iteration,
+            "valid_ndcg": self.valid_ndcg,
             "features": FEATURE_COLUMNS,
         }
         (path / "ranker_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -149,4 +150,5 @@ class LambdaRanker:
         obj = cls(RankerConfig(**meta["config"]))
         obj._booster = lgb.Booster(model_file=str(path / "ranker.txt"))
         obj.best_iteration = int(meta["best_iteration"])
+        obj.valid_ndcg = meta.get("valid_ndcg")
         return obj

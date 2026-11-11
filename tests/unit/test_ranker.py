@@ -90,6 +90,7 @@ def test_training_frame_groups_are_contiguous():
 def test_ranker_learns_planted_signal(fitted):
     importance = fitted.feature_importance()
     assert max(importance, key=importance.get) == "movie_mean_rating"
+    assert fitted.valid_ndcg is not None and 0.9 < fitted.valid_ndcg <= 1.0
     holdout = _planted_frame(n_users=50, seed=1)
     random_scores = np.random.default_rng(2).random(len(holdout))
     assert _mean_ndcg(holdout, fitted.predict(holdout)) > 0.95
@@ -109,6 +110,7 @@ def test_ranker_save_load_same_predictions(fitted, tmp_path):
     holdout = _planted_frame(n_users=20, seed=4)
     np.testing.assert_allclose(loaded.predict(holdout), fitted.predict(holdout))
     assert loaded.best_iteration == fitted.best_iteration and loaded.config == fitted.config
+    assert loaded.valid_ndcg == fitted.valid_ndcg
 
 
 def test_ranker_handles_nan_demographics(fitted):

@@ -8,7 +8,9 @@ model from train/serve skew (spec 3.2).
 Feature groups (spec 2.3):
 - ALS: score and rank of the candidate;
 - movie: popularity (number of ratings), mean rating, year, one-hot genres;
-- user: number of ratings, mean rating, age, gender, occupation (NaN for web users);
+- user: number of ratings, mean rating, age, gender, occupation (NaN for web users); the
+  occupation code is used as a plain number (as a 21-level categorical it overfit the small
+  per-user groups in validation);
 - pair: the user's share of ratings in the candidate's genres (mean and max over its genres).
 """
 
@@ -59,7 +61,6 @@ FEATURE_COLUMNS = [
     "genre_affinity_mean",
     "genre_affinity_max",
 ]
-CATEGORICAL_FEATURES = ["user_occupation"]
 GENDER_CODES = {"F": 0.0, "M": 1.0}
 
 
