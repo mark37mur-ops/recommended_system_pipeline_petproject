@@ -324,7 +324,7 @@ main() {
     prune_images "$TAG" "$PREV_TAG" || log "image prune failed (ignored)"
     return 0
   fi
-  rollback "smoke test failed"
+  rollback "pull, up or smoke test failed"
 }
 
 main "$@"

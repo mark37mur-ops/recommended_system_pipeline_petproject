@@ -154,8 +154,11 @@ def test_caddy_blocks_internal_paths_before_proxying_to_the_api():
     matcher, action = routes[4]
     assert matcher == "path /ready"
     assert action.startswith("reverse_proxy api:8000 {")
+    assert "@ready_ok status 2xx\nhandle_response @ready_ok {" in action
     assert 'respond `{"status":"ready"}` 200' in action
+    assert "@ready_down status 503\nhandle_response @ready_down {" in action
     assert 'respond `{"status":"degraded"}` 503' in action
+    assert "handle_response {" not in action  # other codes (a 404 for /READY) pass through
     assert routes[-1] == ("*", "reverse_proxy api:8000")
     assert len(routes) == 6
     config = CADDYFILE.read_text(encoding="utf-8").splitlines()

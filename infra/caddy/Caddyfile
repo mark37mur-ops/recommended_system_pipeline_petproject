@@ -111,7 +111,10 @@
 				header Content-Type application/json
 				respond `{"status":"ready"}` 200
 			}
-			handle_response {
+			# Only the two answers /ready gives; anything else (e.g. 404 for /READY, which the
+			# case-insensitive matcher also catches) passes through as the API sent it.
+			@ready_down status 503
+			handle_response @ready_down {
 				header Content-Type application/json
 				respond `{"status":"degraded"}` 503
 			}
