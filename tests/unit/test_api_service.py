@@ -226,3 +226,14 @@ def test_user_ratings_map_and_db_down():
     assert service.user_ratings(None) == {}
     repo.down = True
     assert service.user_ratings(user) == {}
+
+
+def test_movielens_user_id_is_never_used_for_ratings():
+    """Defence in depth behind the cookie check: ids below the web range are not web users."""
+    service, repo, _, _ = make_service(StubRecommender())
+    repo.ratings[42] = {1: 3}
+    result = service.rate(42, "1.2.3.4", 10, 4)
+    assert result.created_user and result.user_id >= WEB_USER_ID_START
+    assert repo.ratings[42] == {1: 3} and repo.ratings[result.user_id] == {10: 4}
+    assert service.user_ratings(42) == {}
+    assert service.recommend(42, k=3).n_ratings == 0

@@ -8,6 +8,7 @@ seconds, so a dead Redis costs one timeout every few seconds instead of one per 
 
 import json
 import logging
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ log = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 600
 GENERATION_TTL_SECONDS = 24 * 3600
+MAX_DIRTY_USERS = 10_000
 
 
 class StoreUnavailable(Exception):
@@ -111,11 +113,61 @@ class RecommendationCache:
     new rating). An entry whose generation is not the current one is a miss: this closes the
     race where a request computed recommendations from the old ratings and wrote them after a
     new rating had already invalidated the key. A new model version is a miss by construction.
+
+    If an invalidation fails (Redis down or in its cooldown), the old entry may still be in
+    Redis with a matching generation once Redis is back. Such users are remembered in process
+    (one API process, Decision 9): for them `get` is a miss that retries the invalidation and
+    `put` is skipped, until an invalidation succeeds. A mark expires after `ttl` (the entry it
+    guards was written before the failure, so it is gone by then); more than `max_dirty`
+    marks at once turn the whole cache into a miss for one `ttl` instead.
     """
 
-    def __init__(self, store: KeyValueStore, ttl: int = CACHE_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        store: KeyValueStore,
+        ttl: int = CACHE_TTL_SECONDS,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        max_dirty: int = MAX_DIRTY_USERS,
+    ) -> None:
         self.store = store
         self.ttl = ttl
+        self._clock = clock
+        self._max_dirty = max_dirty
+        self._dirty: dict[int, float] = {}  # user_id -> when its invalidation failed
+        self._all_dirty_until = float("-inf")
+        self._lock = threading.Lock()
+
+    def _cache_off(self) -> bool:
+        return self._clock() < self._all_dirty_until
+
+    def _is_dirty(self, user_id: int) -> bool:
+        now = self._clock()
+        with self._lock:
+            failed_at = self._dirty.get(user_id)
+            if failed_at is None:
+                return False
+            if now - failed_at >= self.ttl:
+                del self._dirty[user_id]
+                return False
+            return True
+
+    def _mark_dirty(self, user_id: int) -> None:
+        now = self._clock()
+        with self._lock:
+            self._dirty[user_id] = now
+            if len(self._dirty) > self._max_dirty:
+                log.warning(
+                    "more than %d failed cache invalidations: cache off for %ds",
+                    self._max_dirty,
+                    self.ttl,
+                )
+                self._dirty.clear()
+                self._all_dirty_until = now + self.ttl
+
+    def _clear_dirty(self, user_id: int) -> None:
+        with self._lock:
+            self._dirty.pop(user_id, None)
 
     @staticmethod
     def key(user_id: int, version: str) -> str:
@@ -134,6 +186,11 @@ class RecommendationCache:
         return int(value) if value is not None else 0
 
     def get(self, user_id: int, version: str) -> CachedRecs | None:
+        if self._cache_off():
+            return None
+        if self._is_dirty(user_id):
+            self.invalidate(user_id, version)  # retry; the entry is not trusted either way
+            return None
         try:
             entry, generation = self.store.get_many(
                 [self.key(user_id, version), self.generation_key(user_id)]
@@ -148,7 +205,7 @@ class RecommendationCache:
         return CachedRecs(payload["movie_ids"], payload["path"], payload["n_ratings"])
 
     def put(self, user_id: int, version: str, recs: CachedRecs, generation: int | None) -> None:
-        if generation is None:
+        if generation is None or self._cache_off() or self._is_dirty(user_id):
             return
         payload = {
             "movie_ids": recs.movie_ids,
@@ -164,6 +221,12 @@ class RecommendationCache:
     def invalidate(self, user_id: int, version: str) -> None:
         try:
             self.store.incr_many([self.generation_key(user_id)], GENERATION_TTL_SECONDS)
+        except StoreUnavailable:
+            self._mark_dirty(user_id)
+            return
+        # The generation bump alone already makes every old entry of the user a miss.
+        self._clear_dirty(user_id)
+        try:
             self.store.delete(self.key(user_id, version))
         except StoreUnavailable:
             pass

@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from recsys.db.schema import WEB_USER_ID_START
 from recsys_api.cache import CachedRecs, RateLimiter, RecommendationCache
 from recsys_api.catalog import Catalog, Movie
 from recsys_api.model import LoadedModel, ModelHolder
@@ -81,6 +82,11 @@ class RatingResult:
     n_ratings: int
 
 
+def _web_user(user_id: int | None) -> int | None:
+    """Ids below the web range belong to MovieLens users: never act as one of them."""
+    return user_id if user_id is not None and user_id >= WEB_USER_ID_START else None
+
+
 class RecommendationService:
     def __init__(
         self,
@@ -107,6 +113,7 @@ class RecommendationService:
 
     # ----- recommendations ---------------------------------------------------------------
     def recommend(self, user_id: int | None, k: int) -> Recommendation:
+        user_id = _web_user(user_id)
         model = self.models.current
         version = model.version if model is not None else None
         catalog = self.catalog()
@@ -175,6 +182,7 @@ class RecommendationService:
     # ----- ratings ----------------------------------------------------------------------
     def rate(self, user_id: int | None, ip: str, movie_id: int, rating: int) -> RatingResult:
         """Validate, rate-limit and upsert one rating; creates the web user on first rating."""
+        user_id = _web_user(user_id)
         catalog = self.catalog()
         if len(catalog) == 0:
             raise DatabaseUnavailable("movie catalog is not loaded")
@@ -200,6 +208,7 @@ class RecommendationService:
 
     def user_ratings(self, user_id: int | None) -> dict[int, int]:
         """The visitor's ratings for display; empty when unknown or the database is down."""
+        user_id = _web_user(user_id)
         if user_id is None:
             return {}
         try:

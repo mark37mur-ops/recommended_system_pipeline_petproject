@@ -100,6 +100,14 @@ class Warmup:
             self._thread.join(timeout=5)
 
 
+def _model_seed(recommender, n: int = 5) -> list[int]:
+    """The model's own most-rated movies: smoke-test input while the catalog is not loaded."""
+    feats = getattr(recommender, "movie_feats", None)
+    if feats is None or "movie_n_ratings" not in feats:
+        return []
+    return [int(m) for m in feats["movie_n_ratings"].nlargest(n).index]
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -134,9 +142,11 @@ def create_app(
 
     def validate(recommender) -> None:
         """Smoke prediction before a new model goes live; raises -> old model stays."""
-        seed = catalog.current.popular(5)
-        if seed:
-            recommender.recommend_new_user([(m, 5) for m in seed], k=10)
+        seed = catalog.current.popular(5) or _model_seed(recommender)
+        if not seed:
+            raise ValueError("no movies to validate the model on (catalog not loaded)")
+        if not recommender.recommend_new_user([(m, 5) for m in seed], k=10):
+            raise ValueError(f"smoke prediction returned no recommendations for {seed}")
 
     models = ModelHolder(loader, probe, validate=validate, observer=observer)
     service = RecommendationService(
@@ -272,10 +282,10 @@ def create_app(
 
     @app.post("/admin/reload-model", response_model=ReloadOut)
     def reload_model(request: Request, force: bool = False) -> JSONResponse:
-        if settings.admin_token is None:
+        expected = settings.admin_token.get_secret_value() if settings.admin_token else ""
+        if not expected:  # never compare against an empty token: that would accept "Bearer "
             raise HTTPException(503, "ADMIN_TOKEN is not configured")
         scheme, _, given = request.headers.get("authorization", "").partition(" ")
-        expected = settings.admin_token.get_secret_value()
         if scheme.lower() != "bearer" or not hmac.compare_digest(given.encode(), expected.encode()):
             raise HTTPException(401, "bad admin token", headers={"WWW-Authenticate": "Bearer"})
         try:

@@ -14,14 +14,17 @@ from recsys.features import movie_features, movie_genre_matrix, user_features
 from recsys.models.als import ALSCandidateGenerator, ALSConfig
 from recsys.models.two_stage import TwoStageRecommender
 from recsys_api.cache import RedisStore
+from recsys_api.identity import COOKIE_NAME, CookieSigner
 from recsys_api.main import create_app
 from recsys_api.repository import PgRepository
-from recsys_api.service import RatingQuotaExceeded
+from recsys_api.service import RatingQuotaExceeded, UserNotFound
 from recsys_api.settings import Settings
 
 from .conftest import REDIS_URL
 
 VERSION = "it-1"
+SESSION_SECRET = "integration-session-secret-0123456789abcdef"
+ADMIN_TOKEN = "integration-admin-token-0123456789abcdef"
 
 
 class Champion:
@@ -46,7 +49,7 @@ def loaded_db(db, tmp_path):
 
 
 def make_client(engine, recommender, redis_url=REDIS_URL, **overrides) -> TestClient:
-    settings = Settings(session_secret="it-secret", admin_token="it-token", **overrides)
+    settings = Settings(session_secret=SESSION_SECRET, admin_token=ADMIN_TOKEN, **overrides)
     app = create_app(
         settings,
         repo=PgRepository(engine),
@@ -165,3 +168,43 @@ def test_catalog_popularity_counts_all_ratings(loaded_db):
     assert len(movies) == len(make_movies())
     assert all(movies[int(m)].n_ratings == int(n) for m, n in expected.items())
     assert movies[5].genres == ("Horror", "Romance")
+
+
+def movielens_rows(engine, user_id: int) -> list[tuple]:
+    query = (
+        select(ratings.c.movie_id, ratings.c.rating, ratings.c.source)
+        .where(ratings.c.user_id == user_id)
+        .order_by(ratings.c.movie_id)
+    )
+    with engine.connect() as conn:
+        return [tuple(r) for r in conn.execute(query)]
+
+
+def test_upsert_never_writes_into_a_movielens_user(loaded_db):
+    """Review I3: the row lock is taken on web users only, so even a MovieLens id that got
+    past the cookie check cannot overwrite (or add to) the training ratings."""
+    repo = PgRepository(loaded_db)
+    before = movielens_rows(loaded_db, 1)
+    movie_id, rating, source = before[0]
+    assert source == "movielens"
+    rated = {r[0] for r in before}
+    unrated = next(int(m) for m in make_movies()["movie_id"] if int(m) not in rated)
+    for target in (movie_id, unrated):
+        with pytest.raises(UserNotFound):
+            repo.upsert_rating(1, target, 1 if rating != 1 else 2, max_ratings=300)
+    assert movielens_rows(loaded_db, 1) == before
+
+
+def test_signed_cookie_for_a_movielens_user_creates_a_web_user(
+    loaded_db, recommender, redis_client
+):
+    before = movielens_rows(loaded_db, 1)
+    movie_id, rating, _ = before[0]
+    with make_client(loaded_db, recommender) as client:
+        client.cookies.set(COOKIE_NAME, CookieSigner(SESSION_SECRET).sign(1))
+        new = 1 if rating != 1 else 2
+        response = client.post("/ratings", json={"movie_id": movie_id, "rating": new})
+        assert response.status_code == 200 and response.json()["n_ratings"] == 1
+    assert movielens_rows(loaded_db, 1) == before
+    (web_user,) = web_user_ids(loaded_db)
+    assert movielens_rows(loaded_db, web_user) == [(movie_id, new, "web")]

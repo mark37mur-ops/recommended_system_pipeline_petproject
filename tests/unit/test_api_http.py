@@ -2,22 +2,26 @@
 
 import time
 
+import pandas as pd
 import pytest
 from api_fakes import FakeChampion, FakeRepository, FakeStore, StubRecommender
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
-from recsys_api.identity import COOKIE_NAME
+from recsys.db.schema import WEB_USER_ID_START
+from recsys_api.identity import COOKIE_NAME, CookieSigner
 from recsys_api.main import create_app
 from recsys_api.settings import Settings
 
-TOKEN = "admin-secret"
+TOKEN = "unit-test-admin-token-0123456789abcdef"
+SESSION_SECRET = "unit-test-session-secret-0123456789abcdef"
 
 
 class Registry:
-    def __init__(self, version: str | None = "7", fail: bool = False) -> None:
+    def __init__(self, version: str | None = "7", fail: bool = False, recommender=None) -> None:
         self.version = version
         self.fail = fail
-        self.recommender = StubRecommender()
+        self.recommender = recommender or StubRecommender()
 
     def probe(self):
         return self.version
@@ -30,7 +34,7 @@ class Registry:
 
 def make_client(registry=None, repo=None, store=None, background=False, **overrides):
     settings = Settings(
-        session_secret="cookie-secret",
+        session_secret=SESSION_SECRET,
         admin_token=TOKEN,
         model_retry_seconds=0.05,
         **overrides,
@@ -249,8 +253,7 @@ def test_admin_reload_contract():
         assert client.get("/ready").json()["model"]["version"] == "8"
 
 
-def test_admin_disabled_without_token():
-    settings = Settings(session_secret="s", admin_token=None)
+def app_with(settings: Settings) -> TestClient:
     registry = Registry()
     app = create_app(
         settings,
@@ -260,5 +263,77 @@ def test_admin_disabled_without_token():
         probe=registry.probe,
         background=False,
     )
-    with TestClient(app) as client:
+    return TestClient(app)
+
+
+def test_admin_disabled_without_token():
+    with app_with(Settings(session_secret=SESSION_SECRET, admin_token=None)) as client:
         assert client.post("/admin/reload-model").status_code == 503
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        Settings(session_secret=SESSION_SECRET, admin_token=""),
+        # Even if validation is bypassed, an empty token never authorises anybody.
+        Settings.model_construct(session_secret=None, admin_token=SecretStr("")),
+    ],
+    ids=["validated", "constructed"],
+)
+@pytest.mark.parametrize("header", ["Bearer ", "Bearer", "bearer  ", ""])
+def test_empty_admin_token_disables_reload(settings, header):
+    with app_with(settings) as client:
+        response = client.post("/admin/reload-model?force=true", headers={"Authorization": header})
+        assert response.status_code == 503
+
+
+def test_cookie_for_a_movielens_user_id_is_a_new_visitor():
+    """A validly signed cookie for an id below the web range (a MovieLens user) must not let
+    anybody write into that user's training data: it is ignored like a forged one."""
+    repo = FakeRepository()
+    repo.ratings[42] = {1: 3}
+    with make_client(repo=repo) as client:
+        client.cookies.set(COOKIE_NAME, CookieSigner(SESSION_SECRET).sign(42))
+        assert client.get("/movies/onboarding").json()["items"][0]["user_rating"] is None
+        response = rate(client, 1, 5)
+        assert response.status_code == 200 and response.json()["n_ratings"] == 1
+        new_id = int(response.headers["set-cookie"].split("=", 1)[1].split(".", 1)[0])
+        assert new_id >= WEB_USER_ID_START
+    assert repo.ratings[42] == {1: 3} and repo.ratings[new_id] == {1: 5}
+
+
+class ModelWithMovies(StubRecommender):
+    """Stub with the `movie_feats` table of a real TwoStageRecommender (popularity column)."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.movie_feats = pd.DataFrame(
+            {"movie_n_ratings": [1.0, 50.0, 40.0, 30.0, 20.0, 10.0]},
+            index=pd.Index([9, 1, 2, 3, 4, 5], name="movie_id"),
+        )
+
+
+def test_model_returning_nothing_is_not_put_live():
+    registry = Registry(recommender=StubRecommender(known=[999]))  # [] for every visitor
+    with make_client(registry) as client:
+        ready = client.get("/ready").json()
+        assert ready["model"]["loaded"] is False
+        assert "no recommendations" in ready["model"]["last_error"]
+
+
+def test_model_is_validated_on_its_own_movies_when_the_catalog_is_empty():
+    repo = FakeRepository()
+    repo.down = True  # catalog cannot be loaded at start-up
+    recommender = ModelWithMovies()
+    with make_client(Registry(recommender=recommender), repo=repo) as client:
+        assert client.get("/ready").json()["model"]["version"] == "7"
+        assert sorted(m for m, _ in recommender.calls[0]) == [1, 2, 3, 4, 5]
+
+
+def test_model_without_any_movie_to_validate_on_is_not_put_live():
+    repo = FakeRepository()
+    repo.down = True
+    with make_client(repo=repo) as client:  # plain stub: no catalog, no movie_feats
+        ready = client.get("/ready").json()
+        assert ready["model"]["loaded"] is False
+        assert "validate" in ready["model"]["last_error"]

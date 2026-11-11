@@ -98,12 +98,16 @@ class PgRepository:
 
     def upsert_rating(self, user_id: int, movie_id: int, rating: int, max_ratings: int) -> int:
         """Upsert under a row lock on the user, so concurrent ratings of one user cannot both
-        pass the quota check (spec 3.4: at most `max_ratings` ratings per user)."""
+        pass the quota check (spec 3.4: at most `max_ratings` ratings per user). Only web users
+        are locked: a MovieLens id raises UserNotFound, so training ratings are never
+        overwritten from the web."""
 
         def run():
             with self.engine.begin() as conn:
                 locked = conn.execute(
-                    select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+                    select(users.c.user_id)
+                    .where(users.c.user_id == user_id, users.c.source == "web")
+                    .with_for_update()
                 ).first()
                 if locked is None:
                     raise UserNotFound(user_id)

@@ -34,3 +34,10 @@ def test_other_secret_rejects_and_none_is_none():
 def test_empty_secret_is_refused():
     with pytest.raises(ValueError):
         CookieSigner("")
+
+
+@pytest.mark.parametrize("user_id", [1, 42, 6040, 999_999])
+def test_ids_below_the_web_range_are_rejected_even_when_signed(user_id):
+    """Review I3: MovieLens users (ids < WEB_USER_ID_START) are never web visitors."""
+    signer = CookieSigner("secret")
+    assert signer.verify(signer.sign(user_id)) is None
