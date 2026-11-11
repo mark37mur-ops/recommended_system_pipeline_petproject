@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from recsys.pipelines.baseline import run_baseline
+from recsys.data.movielens import load_ratings
+from recsys.data.split import temporal_split
+from recsys.pipelines.baseline import build_history, recommend_for_test_users, run_baseline
 
 N_USERS = 30
 N_RATINGS = 20
@@ -27,6 +29,36 @@ def test_run_baseline_returns_metrics_in_unit_range(raw_dir):
     result = run_baseline(raw_dir)
     assert set(result) == {"ndcg_at_10", "recall_at_10", "coverage"}
     assert all(0.0 <= v <= 1.0 for v in result.values())
+
+
+def test_run_baseline_matches_golden_values(raw_dir):
+    # Golden values for this synthetic fixture, computed after the F1+F2 fixes and cross-checked
+    # with an independent pure-python implementation of the same protocol.
+    result = run_baseline(raw_dir)
+    assert result["ndcg_at_10"] == pytest.approx(0.5292149112368794)
+    assert result["recall_at_10"] == pytest.approx(0.5666666666666667)
+    assert result["coverage"] == pytest.approx(0.6)
+
+
+def test_recommendations_exclude_every_seen_movie(raw_dir):
+    split = temporal_split(load_ratings(raw_dir))
+    _, seen = build_history(split)
+    recommendations = recommend_for_test_users(split, k=10)
+    assert recommendations
+    for user, recs in recommendations.items():
+        assert len(recs) == 10
+        assert not set(recs) & seen[user]
+
+
+def test_history_contains_no_test_ratings(raw_dir):
+    split = temporal_split(load_ratings(raw_dir))
+    history, seen = build_history(split)
+    keys = lambda df: set(zip(df["user_id"], df["movie_id"], strict=True))  # noqa: E731
+    assert not keys(history) & keys(split.test)
+    assert len(history) == len(split.als_train) + len(split.ranker_train)
+    for user, movies in seen.items():
+        test_movies = set(split.test.loc[split.test["user_id"] == user, "movie_id"])
+        assert not movies & test_movies
 
 
 def test_run_baseline_is_deterministic(raw_dir):
