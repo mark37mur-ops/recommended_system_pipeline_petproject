@@ -29,7 +29,7 @@ split: [ als_train | ranker_train (5) | test (5) ]
   ALS_A.fit(als_train) → 100 кандидатов на пользователя из ranker_train (seen = als_train)
   признаки из als_train (популярность, средние, жанровые профили), демография из users.dat
   метка = 1, если кандидат есть в ranker_train пользователя, иначе 0
-  LGBMRanker(lambdarank) учится на этих группах (early stopping на 10% пользователей)
+  LGBMRanker(lambdarank) учится на этих группах (early stopping на 20% пользователей ranker_train)
 
 Стадия B (оценка на test):
   history = als_train ∪ ranker_train
@@ -59,6 +59,7 @@ split: [ als_train | ranker_train (5) | test (5) ]
 13. **Pyfunc «models from code»** (`pyfunc_entry.py` вызывает `mlflow.models.set_model`), а не pickle объекта: так рекомендует MLflow 3, в артефактах нет cloudpickle. `input_example` при логировании заодно прогоняет бандл через predict (smoke-тест).
 14. **Дефолты ALS из sweep:** `factors=64, regularization=0.05, alpha=0.5, rating_weight=linear` (лучший валидационный NDCG@10 = 0.0700 среди `linear`; `binary` дал 0.0702 — разница в пределах шума, выбран соответствующий spec `linear`). Сетка: factors {32, 64, 128} × regularization {0.05, 5} × alpha {0.25, 0.5, 1, 2} + `binary`.
 15. **Честность протокола.** Конфиг ранжировщика (п. 12) выбирался по валидации, но test-таблица до и после этой правки была посмотрена (два взгляда на test). Сетка ALS и выбор её победителя на test не смотрели.
+16. **Конфиг ранжировщика заморожен.** Дальнейший тюнинг LightGBM — только по отложенной выборке ранжировщика (holdout стадии A), без обращения к test (продолжение п. 15).
 
 ## Review Focus
 
