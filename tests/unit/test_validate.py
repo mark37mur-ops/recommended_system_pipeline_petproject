@@ -59,4 +59,6 @@ def test_all_problems_reported_together():
     df = _make().astype({"rating": "float64"})
     df.loc[0, "rating"] = np.nan
     df.loc[1, "user_id"] = df.loc[0, "user_id"]
-    assert len(_problems(df)) >= 2
+    problems = _problems(df)
+    assert any("null" in p for p in problems)
+    assert any("duplicate" in p for p in problems)
