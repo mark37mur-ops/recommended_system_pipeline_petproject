@@ -14,6 +14,7 @@ dependencies = [
     "mlflow-skinny>=3.18.0",
     "numpy>=2.5.4",
     "pandas>=3.1.1",
+    "prometheus-client>=0.26.0",
     "psycopg[binary]>=3.3.8",
     "pyarrow>=26.0.1",
     "pydantic-settings>=2.16.2",
@@ -33,7 +34,11 @@ build-backend = "uv_build"
 dev = [
     "httpx2>=2.16.0",
     "pytest>=9.2.0",
+    "pyyaml>=6.0.3",
     "ruff>=0.17.4",
+]
+drift = [
+    "evidently>=0.7.23",
 ]
 mlflow-store = [
     "mlflow>=3.18.0",
@@ -44,9 +49,10 @@ notebooks = [
 ]
 
 [tool.uv]
-# `uv sync` installs the full MLflow (local sqlite store, server) next to the dev tools; the API
+# `uv sync` installs the full MLflow (local sqlite store, server), Evidently (drift reports of
+# retrain_daily; the Airflow image adds it with --group drift) and the dev tools; the API
 # image installs only the core dependencies (mlflow-skinny client) with --no-default-groups.
-default-groups = ["dev", "mlflow-store"]
+default-groups = ["dev", "mlflow-store", "drift"]
 
 [tool.ruff]
 line-length = 100
