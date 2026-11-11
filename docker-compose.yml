@@ -1,11 +1,12 @@
 # Local stack (spec 1, 6.2): Postgres (app + mlflow DBs), Redis, MLflow server, API.
-#   cp .env.example .env   # and fill in the secrets
+#   cp .env.example .env   # and replace every change-me (the API refuses to start with them)
 #   docker compose up -d --build
 #   docker compose --profile tools run --rm loader    # MovieLens 1M -> Postgres (idempotent)
 #   docker compose --profile tools run --rm trainer   # train + register champion on MLflow
 #   curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:8000/admin/reload-model
-# Only the API is published on all interfaces; Postgres, Redis and MLflow listen on
-# 127.0.0.1 of the host (MLflow has no auth of its own). Stage 4 adds Airflow (its database
+# Every port is published on 127.0.0.1 of the host only (MLflow has no auth of its own; the
+# API is reached from other machines through Caddy in docker-compose.prod.yml, stage 6).
+# Stage 4 adds Airflow (its database
 # is created by the Postgres init script when AIRFLOW_DB_PASSWORD is set), stage 5
 # Prometheus + Grafana, stage 6 Caddy in docker-compose.prod.yml.
 name: movielens-recsys
@@ -37,8 +38,9 @@ services:
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      # "app" exists only after the init script has run, so healthy = ready for clients.
-      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      # Over TCP: during the first-start init the entrypoint runs a temporary server that
+      # listens on the unix socket only, so this passes only once init is done.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d app"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -110,8 +112,12 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       MODEL_RETRY_SECONDS: ${MODEL_RETRY_SECONDS:-30}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      # Proxies whose X-Forwarded-For uvicorn trusts (client IP for the rate limit). Stage 6:
+      # set it to Caddy's address, otherwise every visitor shares Caddy's (or the Docker
+      # gateway's) IP and thus one rate-limit bucket.
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
