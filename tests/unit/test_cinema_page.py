@@ -743,7 +743,14 @@ main()
 
 @pytest.mark.parametrize(
     "scenario",
-    ["contract", "stale-history", "stale-watchlist", "keyboard-onboarding", "keyboard-history", "keyboard-search"],
+    [
+        "contract",
+        "stale-history",
+        "stale-watchlist",
+        "keyboard-onboarding",
+        "keyboard-history",
+        "keyboard-search",
+    ],
 )
 def test_cinema_browser_contract(scenario):
     import os
