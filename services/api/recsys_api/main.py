@@ -34,20 +34,25 @@ from recsys_api.cache import KeyValueStore, RateLimiter, RecommendationCache, Re
 from recsys_api.catalog import CatalogHolder
 from recsys_api.identity import COOKIE_NAME, CookieSigner
 from recsys_api.impressions import ImpressionLogger, ImpressionObserver, RecentImpressions
+from recsys_api.metadata import MetadataHolder
 from recsys_api.metrics import ApiMetrics, MetricsMiddleware, MetricsObserver
 from recsys_api.model import ModelHolder
 from recsys_api.observer import CompositeObserver, Observer
 from recsys_api.schemas import (
+    FeedbackIn,
+    FeedbackOut,
     MovieList,
     MovieOut,
     RatingIn,
     RatingOut,
+    RatingsOut,
     RecommendationsOut,
     ReloadOut,
 )
 from recsys_api.service import (
     MAX_K,
     DatabaseUnavailable,
+    MovieAlreadyRated,
     RateLimited,
     RatingQuotaExceeded,
     RecommendationService,
@@ -88,8 +93,16 @@ def _configure_logging(level: str, fmt: str) -> None:
 class Warmup:
     """Background start-up: schema + catalog, then the model; retried until both are done."""
 
-    def __init__(self, repo, catalog: CatalogHolder, models: ModelHolder, retry: float) -> None:
+    def __init__(
+        self,
+        repo,
+        catalog: CatalogHolder,
+        models: ModelHolder,
+        retry: float,
+        refresh_metadata: Callable[[], None] | None = None,
+    ) -> None:
         self.repo, self.catalog, self.models, self.retry = repo, catalog, models, retry
+        self.refresh_metadata = refresh_metadata
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -99,6 +112,8 @@ class Warmup:
                 self.repo.ensure_schema()
                 size = self.catalog.refresh(self.repo)
                 log.info("movie catalog loaded: %d movies", size)
+                if self.refresh_metadata is not None:
+                    self.refresh_metadata()
             except DatabaseUnavailable as exc:
                 log.warning("catalog not loaded yet (database unavailable): %s", exc)
         if self.models.current is None:
@@ -141,12 +156,14 @@ def create_app(
     probe: Callable[[], str | None] | None = None,
     observer: Observer | None = None,
     background: bool = True,
+    metadata_holder: MetadataHolder | None = None,
 ) -> FastAPI:
     """Wire the app. Arguments other than `settings` replace real Postgres / Redis / MLflow
     (tests); `background=False` runs one synchronous warm-up attempt instead of the thread."""
     settings = settings or Settings()
     _configure_logging(settings.log_level, settings.log_format)
 
+    engine = None
     if repo is None:
         from recsys_api.repository import PgRepository
 
@@ -176,6 +193,14 @@ def create_app(
     observer = CompositeObserver(observers)
 
     catalog = CatalogHolder()
+    metadata_holder = metadata_holder if metadata_holder is not None else MetadataHolder()
+
+    def refresh_metadata() -> None:
+        if engine is not None:
+            try:
+                metadata_holder.refresh(engine)
+            except Exception:
+                log.warning("movie metadata refresh failed; keeping previous snapshot")
 
     def validate(recommender) -> None:
         """Smoke prediction before a new model goes live; raises -> old model stays."""
@@ -207,7 +232,7 @@ def create_app(
         log.warning("SESSION_SECRET is not set: visitor cookies will not survive a restart")
         secret = secrets.token_urlsafe(32)
     signer = CookieSigner(secret)
-    warmup = Warmup(repo, catalog, models, settings.model_retry_seconds)
+    warmup = Warmup(repo, catalog, models, settings.model_retry_seconds, refresh_metadata)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -229,6 +254,7 @@ def create_app(
     templates = Jinja2Templates(directory=HERE / "templates")
     app.state.service, app.state.models, app.state.catalog = service, models, catalog
     app.state.metrics, app.state.impressions = metrics, impressions
+    app.state.metadata = metadata_holder
 
     def current_user(request: Request) -> int | None:
         return signer.verify(request.cookies.get(COOKIE_NAME))
@@ -236,9 +262,25 @@ def create_app(
     def client_ip(request: Request) -> str:
         return request.client.host if request.client else "unknown"
 
+    def set_visitor_cookie(response: Response, user_id: int, previous: int | None) -> None:
+        if user_id != previous:
+            response.set_cookie(
+                COOKIE_NAME,
+                signer.sign(user_id),
+                max_age=COOKIE_MAX_AGE,
+                httponly=True,
+                samesite="lax",
+                secure=settings.cookie_secure,
+            )
+
     def movie_list(movies, user_id: int | None) -> MovieList:
         mine = service.user_ratings(user_id) if movies else {}
-        return MovieList(items=[MovieOut.of(m, mine.get(m.movie_id)) for m in movies])
+        return MovieList(
+            items=[
+                MovieOut.of(m, mine.get(m.movie_id), metadata_holder.get(m.movie_id))
+                for m in movies
+            ]
+        )
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def index(request: Request):
@@ -255,7 +297,13 @@ def create_app(
     def search(
         request: Request, q: Annotated[str, Query(min_length=2, max_length=100)]
     ) -> MovieList:
-        return movie_list(catalog.current.search(q), current_user(request))
+        found = catalog.current.search(q)
+        seen = {m.movie_id for m in found}
+        for movie_id in metadata_holder.search(q):
+            if movie_id not in seen and movie_id in catalog.current:
+                found.append(catalog.current.get(movie_id))
+                seen.add(movie_id)
+        return movie_list(found[:20], current_user(request))
 
     @app.post("/ratings", response_model=RatingOut)
     def post_rating(body: RatingIn, request: Request, response: Response) -> RatingOut:
@@ -273,16 +321,73 @@ def create_app(
             raise HTTPException(403, f"rating limit of {limit} per user reached") from exc
         except DatabaseUnavailable as exc:
             raise HTTPException(503, "ratings are temporarily unavailable") from exc
-        if result.user_id != user_id:
-            response.set_cookie(
-                COOKIE_NAME,
-                signer.sign(result.user_id),
-                max_age=COOKIE_MAX_AGE,
-                httponly=True,
-                samesite="lax",
-                secure=settings.cookie_secure,
-            )
+        set_visitor_cookie(response, result.user_id, user_id)
         return RatingOut(movie_id=result.movie_id, rating=result.rating, n_ratings=result.n_ratings)
+
+    @app.get("/ratings", response_model=RatingsOut)
+    def rating_history(request: Request) -> RatingsOut:
+        try:
+            mine = service.rating_history(current_user(request))
+        except DatabaseUnavailable as exc:
+            raise HTTPException(503, "ratings are temporarily unavailable") from exc
+        if any(mid not in catalog.current for mid in mine):
+            raise HTTPException(503, "movie catalog is still loading")
+        items = [
+            MovieOut.of(catalog.current.get(mid), value, metadata_holder.get(mid))
+            for mid, value in mine.items()
+            if mid in catalog.current
+        ]
+        return RatingsOut(items=items, n_ratings=len(mine), min_ratings=service.min_personal)
+
+    @app.get("/watchlist", response_model=MovieList)
+    def watchlist(request: Request) -> MovieList:
+        try:
+            own = service.feedback(current_user(request))
+        except DatabaseUnavailable as exc:
+            raise HTTPException(503, "watchlist is temporarily unavailable") from exc
+        if any(mid not in catalog.current for mid, state in own.items() if state == "watchlist"):
+            raise HTTPException(503, "movie catalog is still loading")
+        return MovieList(
+            items=[
+                MovieOut.of(catalog.current.get(mid), metadata=metadata_holder.get(mid))
+                for mid, state in own.items()
+                if state == "watchlist" and mid in catalog.current
+            ]
+        )
+
+    @app.post("/feedback", response_model=FeedbackOut)
+    def post_feedback(body: FeedbackIn, request: Request, response: Response) -> FeedbackOut:
+        user_id = current_user(request)
+        try:
+            result = service.set_feedback(user_id, client_ip(request), body.movie_id, body.state)
+        except UnknownMovie as exc:
+            raise HTTPException(422, "unknown movie") from exc
+        except MovieAlreadyRated as exc:
+            raise HTTPException(409, "movie has already been rated") from exc
+        except RateLimited as exc:
+            raise HTTPException(
+                429, "try again in a minute", headers={"Retry-After": "60"}
+            ) from exc
+        except DatabaseUnavailable as exc:
+            raise HTTPException(503, "saving is temporarily unavailable") from exc
+        set_visitor_cookie(response, result.user_id, user_id)
+        return FeedbackOut(movie_id=result.movie_id, state=result.state)
+
+    @app.delete("/watchlist/{movie_id}", status_code=204)
+    def remove_watchlist(movie_id: int, request: Request) -> Response:
+        if movie_id <= 0:
+            raise HTTPException(422, "invalid movie")
+        try:
+            service.remove_watchlist(current_user(request), client_ip(request), movie_id)
+        except UnknownMovie as exc:
+            raise HTTPException(422, "unknown movie") from exc
+        except RateLimited as exc:
+            raise HTTPException(
+                429, "try again in a minute", headers={"Retry-After": "60"}
+            ) from exc
+        except DatabaseUnavailable as exc:
+            raise HTTPException(503, "saving is temporarily unavailable") from exc
+        return Response(status_code=204)
 
     @app.get("/recommendations", response_model=RecommendationsOut)
     def recommendations(
@@ -298,7 +403,11 @@ def create_app(
             )
         rec = service.recommend(user_id, k)
         current = catalog.current
-        items = [MovieOut.of(current.get(m)) for m in rec.movie_ids if m in current]
+        items = [
+            MovieOut.of(current.get(m), metadata=metadata_holder.get(m))
+            for m in rec.movie_ids
+            if m in current
+        ]
         return RecommendationsOut(
             items=items,
             path=rec.path,
@@ -351,7 +460,9 @@ def create_app(
         if scheme.lower() != "bearer" or not hmac.compare_digest(given.encode(), expected.encode()):
             raise HTTPException(401, "bad admin token", headers={"WWW-Authenticate": "Bearer"})
         try:
+            repo.ensure_schema()
             catalog_size: int | None = catalog.refresh(repo)
+            refresh_metadata()
         except DatabaseUnavailable:
             catalog_size = None
         result = models.reload(force=force)

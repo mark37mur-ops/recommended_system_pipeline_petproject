@@ -433,3 +433,63 @@ def test_newer_commit_is_deployed(app, shell):
 
     assert result.returncode == 0, result.output
     assert env_value(app, "IMAGE_TAG") == NEW
+
+
+def test_schema_runs_before_new_api(app, shell):
+    result = shell.run("deploy.sh", NEW, NEW_SHA, cwd=app, FAKE_GIT_HEAD=OLD_SHA, **FAST)
+    assert result.returncode == 0, result.output
+    calls = result.calls
+    schema = next(
+        i
+        for i, c in enumerate(calls)
+        if " run --rm --no-deps api python -c " in c and "create_schema" in c
+    )
+    pull = next(i for i, c in enumerate(calls) if c.startswith("docker compose") and " pull " in c)
+    up = next(
+        i
+        for i, c in enumerate(calls)
+        if c.startswith("docker compose") and " up -d --remove-orphans" in c
+    )
+    assert pull < schema < up
+
+
+def test_schema_failure_restores_previous_ref_tag(app, shell):
+    docker = shell.bin / "docker"
+    body = docker.read_text()
+    body = body.replace("  case $args in", '  case $args in\n    *"create_schema"*) exit 1 ;;')
+    docker.write_text(body, newline="\n")
+    result = shell.run("deploy.sh", NEW, NEW_SHA, cwd=app, FAKE_GIT_HEAD=OLD_SHA, **FAST)
+    assert result.returncode != 0
+    assert env_value(app, "IMAGE_TAG") == OLD
+    assert result.file("head") == OLD_SHA
+    assert NEW not in ups(result.calls)
+    assert not any("drop" in c.lower() or "down -v" in c for c in result.calls)
+
+
+def test_smoke_failure_rolls_back_without_dropping_tables(app, shell):
+    result = shell.run(
+        "deploy.sh", NEW, NEW_SHA, cwd=app, FAKE_GIT_HEAD=OLD_SHA, FAKE_BAD_RECS_TAGS=NEW, **FAST
+    )
+    assert result.returncode != 0
+    assert env_value(app, "IMAGE_TAG") == OLD
+    assert any("create_schema" in c for c in result.calls)
+    assert not any("drop_all" in c or "down -v" in c for c in result.calls)
+
+
+def test_stopped_database_is_ready_and_initialized_before_schema(app, shell):
+    docker = shell.bin / "docker"
+    body = docker.read_text()
+    body = body.replace(
+        "  case $args in",
+        '  case $args in\n    *"create_schema"*) '
+        '[ -f "$FAKE_STATE/postgres-ready" ] && '
+        '[ -f "$FAKE_STATE/db-initialized" ] || exit 1 ;;',
+    )
+    docker.write_text(body, newline="\n")
+    (app / ".env").write_text(env_file(None), newline="\n")
+    (shell.state / "running").unlink()
+    result = shell.run("deploy.sh", NEW, cwd=app, DEPLOY_GIT_SYNC="0", **FAST)
+    assert result.returncode == 0, result.output
+    assert (shell.state / "postgres-ready").exists()
+    assert (shell.state / "db-initialized").exists()
+    assert ups(result.calls) == [NEW]

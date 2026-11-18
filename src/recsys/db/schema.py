@@ -91,6 +91,31 @@ ratings = Table(
     Index("ratings_movie_id_idx", "movie_id"),
 )
 
+movie_feedback = Table(
+    "movie_feedback",
+    metadata,
+    Column("user_id", Integer, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False),
+    Column("movie_id", Integer, ForeignKey("movies.movie_id"), nullable=False),
+    Column("state", Text, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    PrimaryKeyConstraint("user_id", "movie_id", name="movie_feedback_pkey"),
+    CheckConstraint("state IN ('watchlist', 'dismissed')", name="movie_feedback_state_valid"),
+)
+
+movie_metadata = Table(
+    "movie_metadata",
+    metadata,
+    Column(
+        "movie_id", Integer, ForeignKey("movies.movie_id"), primary_key=True, autoincrement=False
+    ),
+    Column("tmdb_id", Integer, nullable=False),
+    Column("poster_path", Text, nullable=True),
+    Column("title_ru", Text, nullable=True),
+    Column("source", Text, nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    CheckConstraint("source = 'tmdb'", name="movie_metadata_source_valid"),
+)
+
 # One row per `retrain_daily` run whose snapshot passed validation: the "previous run" of the
 # next one (the -5% row-count rule, drift against the previous run). Written by validate_data.
 retrain_runs = Table(

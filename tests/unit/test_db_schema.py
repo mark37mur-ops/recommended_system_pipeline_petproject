@@ -55,3 +55,16 @@ def test_ratings_unique_per_user_and_movie():
     assert [c.name for c in ratings.primary_key.columns] == ["user_id", "movie_id"]
     assert {"movies", "users", "ratings"} <= set(metadata.tables)
     assert "web_user_id_seq" in {s.name for s in metadata._sequences.values()}
+
+
+def test_feedback_and_metadata_are_additive():
+    from recsys.db.schema import movie_feedback, movie_metadata
+
+    assert list(movie_feedback.primary_key.columns.keys()) == ["user_id", "movie_id"]
+    assert movie_feedback.primary_key.name == "movie_feedback_pkey"
+    assert list(movie_metadata.primary_key.columns.keys()) == ["movie_id"]
+    assert len(movie_feedback.foreign_keys) == 2
+    assert len(movie_metadata.foreign_keys) == 1
+    assert {c.name for c in movie_feedback.constraints} >= {"movie_feedback_state_valid"}
+    assert {c.name for c in movie_metadata.constraints} >= {"movie_metadata_source_valid"}
+    assert list(metadata.tables["movies"].columns.keys()) == ["movie_id", "title", "year", "genres"]

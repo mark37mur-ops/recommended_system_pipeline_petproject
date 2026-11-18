@@ -320,13 +320,17 @@ main() {
   SWITCHED=1
   [ -z "$ref" ] || checkout "$ref"
   env_set IMAGE_TAG "$TAG"
-  if compose pull --quiet && compose up -d --remove-orphans && smoke "$GATE"; then
+  if compose pull --quiet \
+      && compose up -d --wait postgres \
+      && compose run --rm --no-deps db-init \
+      && compose run --rm --no-deps api python -c 'import os; from recsys.db.schema import create_schema, make_engine; e=make_engine(os.environ["DATABASE_URL"]); create_schema(e); e.dispose()' \
+      && compose up -d --remove-orphans && smoke "$GATE"; then
     SWITCHED=0
     log "deployed $TAG"
     prune_images "$TAG" "$PREV_TAG" || log "image prune failed (ignored)"
     return 0
   fi
-  rollback "pull, up or smoke test failed"
+  rollback "pull, database preparation, schema, up or smoke test failed"
 }
 
 main "$@"

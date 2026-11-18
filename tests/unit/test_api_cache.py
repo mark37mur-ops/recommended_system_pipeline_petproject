@@ -237,3 +237,27 @@ def test_rating_during_redis_cooldown_does_not_serve_stale_recommendations():
     after = service.recommend(user, 10)
     assert (after.path, after.n_ratings, after.cached) == ("full", 5, False)
     assert service.recommend(user, 10).cached is True  # caching works again afterwards
+
+
+def test_feedback_invalidation_beats_in_flight_recommendation_put():
+    from api_fakes import StubRecommender
+    from test_api_feedback import setup
+    from test_api_service import rate_many
+
+    class Mutating(StubRecommender):
+        mutate = None
+
+        def recommend_new_user(self, ratings, k=10, profile=None):
+            if self.mutate is not None:
+                mutation, self.mutate = self.mutate, None
+                mutation()
+            return super().recommend_new_user(ratings, k, profile)
+
+    model = Mutating()
+    service, _, _, _ = setup(model)
+    user = rate_many(service, None, range(1, 6))
+    model.mutate = lambda: service.set_feedback(user, "ip", 60, "dismissed")
+    service.recommend(user, 10)  # already started reads may use the preceding snapshot
+    after = service.recommend(user, 10)
+    assert not after.cached and 60 not in after.movie_ids
+    assert service.recommend(user, 10).cached

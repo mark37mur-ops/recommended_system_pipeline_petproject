@@ -163,15 +163,15 @@ def test_short_model_list_is_padded_with_popular():
     assert rec.path == "full" and rec.movie_ids == [42, 6, 7, 8]
 
 
-def test_postgres_down_serves_cache_then_popular_and_rejects_writes():
+def test_postgres_down_serves_no_identified_recommendations_and_rejects_writes():
     service, repo, _, _ = make_service(StubRecommender())
     user = rate_many(service, None, [1, 2, 3, 4, 5])
-    warm = service.recommend(user, k=5)
+    service.recommend(user, k=5)
     repo.down = True
     cached = service.recommend(user, k=5)
-    assert cached.cached and cached.movie_ids == warm.movie_ids
+    assert not cached.cached and cached.movie_ids == [] and cached.n_ratings is None
     other = service.recommend(user + 1, k=3)
-    assert other.path == "fallback" and other.movie_ids == [1, 2, 3] and other.n_ratings is None
+    assert other.path == "fallback" and other.movie_ids == [] and other.n_ratings is None
     with pytest.raises(DatabaseUnavailable):
         service.rate(user, "1.2.3.4", 9, 5)
 

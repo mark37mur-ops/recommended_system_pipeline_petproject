@@ -1,74 +1,182 @@
 <!doctype html>
 <html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Кинорекомендации · MovieLens</title>
-  <meta name="description" content="Оцените несколько фильмов и получите персональные рекомендации: ALS + LightGBM на MovieLens 1M.">
-  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
-</head>
-<body>
-  <header class="hero">
-    <div class="wrap">
-      <h1>Кинорекомендации</h1>
-      <p class="lead">
-        Оцените хотя бы {{ min_ratings }} фильмов — и модель подберёт то, что вам стоит посмотреть.
-        Без регистрации: ваши оценки привязаны к этому браузеру.
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#100f12" />
+    <title>Кино на вечер</title>
+    <meta
+      name="description"
+      content="Хороший вечер начинается с хорошего фильма. Найдите своё кино, оцените любимое и сохраните то, что хочется посмотреть."
+    />
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}" />
+    <script src="{{ url_for('static', path='app.js') }}" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Перейти к содержимому</a>
+    <header class="site-header wrap">
+      <a class="brand" href="/" aria-label="Кино на вечер — главная"
+        ><span class="brand-mark" aria-hidden="true">▶</span>Кино на вечер<span
+          class="brand-dot"
+          >.</span
+        ></a
+      >
+      <nav class="navigation" aria-label="Основная навигация">
+        <button type="button" data-view="selection" aria-current="page">
+          <span aria-hidden="true">▱</span>Подборка
+        </button>
+        <button type="button" data-view="watchlist">
+          <span aria-hidden="true">♡</span>Хочу посмотреть
+        </button>
+        <button type="button" data-view="history">
+          <span aria-hidden="true">☆</span>Мои оценки
+        </button>
+      </nav>
+      <span class="header-note">У каждого вечера — своё кино</span>
+    </header>
+    <main id="main" class="wrap" data-min-ratings="{{ min_ratings }}">
+      <div id="startup" class="state">
+        <span class="eyebrow">Свет гаснет. Кино начинается.</span>
+        <p>Вспоминаем ваши фильмы…</p>
+      </div>
+      <section id="selection" hidden aria-labelledby="selection-title">
+        <div id="onboarding" hidden>
+          <div class="hero">
+            <div>
+              <p class="eyebrow">
+                <span class="red-line"></span>В главной роли — ваш вкус
+              </p>
+              <h1 id="selection-title">Найдём кино<br /><em>на вечер</em></h1>
+              <p class="lead">
+                Оцените хотя бы {{ min_ratings }} фильмов, которые смотрели
+              </p>
+              <p class="subtle">
+                От любимой классики до неожиданных открытий. Начнём с того, что
+                вам знакомо.
+              </p>
+            </div>
+            <div class="progress-panel">
+              <span class="eyebrow">Знакомимся с вашим вкусом</span>
+              <p id="progress-text">Вспоминаем ваши оценки…</p>
+              <div class="progress-track"><span id="progress-fill"></span></div>
+              <button
+                id="start-selection"
+                type="button"
+                class="primary"
+                disabled
+              >
+                Подобрать кино <span aria-hidden="true">↗</span></button
+              ><small>Без регистрации. Ваши оценки останутся с вами.</small>
+            </div>
+          </div>
+          <div class="section-heading">
+            <h2>Знакомые лица, любимые истории</h2>
+            <span>Смотрели? Поставьте звёзды</span>
+          </div>
+          <div id="onboarding-grid" class="grid"></div>
+        </div>
+        <div id="recommendations" hidden>
+          <div class="deck-heading">
+            <p class="eyebrow">Один вечер. Тысячи историй.</p>
+            <h1>Кажется, это <em>ваше кино</em></h1>
+            <p class="subtle">
+              Сохраните на вечер или откройте следующую историю.
+            </p>
+          </div>
+          <div
+            id="deck"
+            tabindex="0"
+            aria-label="Подборка фильмов. Стрелки — выбор, пробел — пропустить"
+          ></div>
+        </div>
+      </section>
+      <section id="watchlist" hidden aria-labelledby="watchlist-title">
+        <div class="page-heading">
+          <p class="eyebrow">Хорошее впереди</p>
+          <h1 id="watchlist-title">Хочу <em>посмотреть</em></h1>
+          <p class="subtle">Истории, для которых найдётся свой вечер.</p>
+        </div>
+        <div id="watchlist-grid" class="grid"></div>
+      </section>
+      <section id="history" hidden aria-labelledby="history-title">
+        <div class="page-heading">
+          <p class="eyebrow">Ваш личный кинокритик</p>
+          <h1 id="history-title">Мои <em>оценки</em></h1>
+          <p class="subtle">
+            Можно передумать. Измените оценку в любой момент.
+          </p>
+        </div>
+        <div id="history-grid" class="grid"></div>
+      </section>
+      <section
+        id="search-panel"
+        class="search-panel"
+        hidden
+        aria-labelledby="search-title"
+      >
+        <div>
+          <p class="eyebrow">Есть что-то на примете?</p>
+          <h2 id="search-title">Вспомните ещё один фильм</h2>
+        </div>
+        <label class="search-label"
+          ><span aria-hidden="true">⌕</span
+          ><span class="sr-only">Найти фильм по названию</span
+          ><input
+            id="search"
+            type="search"
+            maxlength="100"
+            autocomplete="off"
+            placeholder="Название фильма…"
+        /></label>
+        <div id="search-grid" class="grid" aria-live="polite"></div>
+      </section>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </main>
+    <footer class="wrap footer">
+      <span class="brand-small"
+        >Кино на вечер<span class="brand-dot">.</span></span
+      ><span>Истории остаются с нами.</span
+      ><button id="about-open" type="button" class="text-button">
+        О сервисе
+      </button>
+    </footer>
+    <dialog id="about" aria-labelledby="about-title">
+      <button
+        id="about-close"
+        type="button"
+        class="dialog-close"
+        aria-label="Закрыть"
+      >
+        ×
+      </button>
+      <p class="eyebrow">Для любви к кино</p>
+      <h2 id="about-title">О сервисе</h2>
+      <p>
+        Оценивайте просмотренное, открывайте знакомую классику и собирайте
+        фильмы для будущих вечеров. Подборка включает фильмы до начала 2000-х.
       </p>
-      <div class="progress" aria-live="polite">
-        <div class="progress-bar"><span id="progress-fill"></span></div>
-        <span id="progress-text">Оценено 0 из {{ min_ratings }}</span>
-      </div>
-    </div>
-  </header>
-
-  <main class="wrap">
-    <section class="panel" id="recs-panel">
-      <div class="panel-head">
-        <h2>Рекомендации для вас</h2>
-        <span class="badge" id="recs-badge"></span>
-      </div>
-      <p class="hint" id="recs-hint"></p>
-      <div class="grid" id="recs-grid"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Найти фильм</h2>
-      </div>
-      <input id="search" class="search" type="search" autocomplete="off"
-             placeholder="Название на английском, например «Matrix» или «Toy Story»"
-             aria-label="Поиск фильма по названию">
-      <div class="grid" id="search-grid"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Для начала оцените известные фильмы</h2>
-      </div>
-      <p class="hint">Популярные фильмы разных жанров. Не смотрели — пропустите.</p>
-      <div class="grid" id="onboarding-grid"></div>
-    </section>
-  </main>
-
-  <footer class="wrap footer">
-    Модель: кандидаты ALS (implicit, fold-in по вашим оценкам) → ранжирование LightGBM lambdarank.
-    Данные: MovieLens 1M (GroupLens).
-  </footer>
-
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
-
-  <template id="card-template">
-    <article class="card">
-      <div class="card-body">
-        <h3 class="title"></h3>
-        <p class="meta"></p>
-      </div>
-      <div class="stars" role="radiogroup"></div>
-    </article>
-  </template>
-
-  <script>window.MIN_RATINGS = {{ min_ratings }};</script>
-  <script src="{{ url_for('static', path='app.js') }}" defer></script>
-</body>
+      <p>
+        Постеры и переведённые названия предоставлены
+        <a href="https://www.themoviedb.org/">TMDB</a>.
+      </p>
+      <img
+        src="{{ url_for('static', path='tmdb-logo.svg') }}"
+        width="100"
+        height="44"
+        alt="TMDB"
+      />
+      <p lang="en" class="attribution">
+        This product uses the TMDB API but is not endorsed or certified by TMDB.
+      </p>
+    </dialog>
+    <noscript
+      ><p class="wrap">
+        Чтобы оценивать фильмы и получать подборку, включите JavaScript в
+        браузере.
+      </p></noscript
+    >
+  </body>
 </html>

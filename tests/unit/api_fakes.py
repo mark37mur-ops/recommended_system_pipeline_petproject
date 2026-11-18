@@ -27,6 +27,7 @@ class FakeRepository:
     def __init__(self, movies: Sequence[Movie] | None = None) -> None:
         self.movies = list(movies if movies is not None else make_catalog_movies())
         self.ratings: dict[int, dict[int, int]] = {}
+        self.feedback_data: dict[int, dict[int, str]] = {}
         self._ids = itertools.count(WEB_USER_ID_START)
         self.down = False
         self.calls: list[str] = []
@@ -64,8 +65,33 @@ class FakeRepository:
         own = self.ratings[user_id]
         if movie_id not in own and len(own) >= max_ratings:
             raise RatingQuotaExceeded(user_id)
+        self.feedback_data.get(user_id, {}).pop(movie_id, None)
         own[movie_id] = rating
         return len(own)
+
+    def user_feedback(self, user_id: int) -> dict[int, str]:
+        self._check("user_feedback")
+        return dict(reversed(list(self.feedback_data.get(user_id, {}).items())))
+
+    def upsert_feedback(self, user_id: int, movie_id: int, state: str) -> None:
+        from recsys_api.service import MovieAlreadyRated
+
+        self._check("upsert_feedback")
+        if user_id not in self.ratings or user_id < WEB_USER_ID_START:
+            raise UserNotFound(user_id)
+        if movie_id in self.ratings[user_id]:
+            raise MovieAlreadyRated(movie_id)
+        own = self.feedback_data.setdefault(user_id, {})
+        own.pop(movie_id, None)
+        own[movie_id] = state
+
+    def delete_watchlist(self, user_id: int, movie_id: int) -> None:
+        self._check("delete_watchlist")
+        if user_id not in self.ratings or user_id < WEB_USER_ID_START:
+            raise UserNotFound(user_id)
+        own = self.feedback_data.get(user_id, {})
+        if own.get(movie_id) == "watchlist":
+            del own[movie_id]
 
     def insert_impressions(self, rows) -> None:
         # Not recorded in `calls`: it runs in the writer thread, at its own pace.

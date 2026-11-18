@@ -76,7 +76,7 @@ def test_page_and_static_assets(client):
 def test_onboarding_lists_twenty_movies_with_own_ratings(client):
     items = client.get("/movies/onboarding").json()["items"]
     assert len(items) == 20 and all(item["user_rating"] is None for item in items)
-    assert set(items[0]) == {"movie_id", "title", "year", "genres", "user_rating"}
+    assert set(items[0]) == {"movie_id", "title", "year", "genres", "user_rating", "poster_url"}
     rate(client, items[0]["movie_id"], 4)
     again = client.get("/movies/onboarding").json()["items"]
     assert again[0]["user_rating"] == 4
@@ -178,7 +178,8 @@ def test_postgres_down():
         repo.down = True
         assert rate(client, 2).status_code == 503
         recs = client.get("/recommendations").json()
-        assert recs["path"] == "fallback" and len(recs["items"]) == 10
+        assert recs["path"] == "fallback" and recs["items"] == []
+        assert recs["n_ratings"] is None
         ready = client.get("/ready")
         assert ready.status_code == 503 and ready.json()["database"] == "unavailable"
 
@@ -358,3 +359,156 @@ def test_recommendations_limit_is_off_while_redis_is_down():
 
 def test_recommendations_limit_default_is_generous():
     assert Settings(session_secret=SESSION_SECRET).recommendations_rate_limit_per_minute == 120
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"movie_id": 1.0, "state": "watchlist"},
+        {"movie_id": True, "state": "watchlist"},
+        {"movie_id": "1", "state": "watchlist"},
+        {"movie_id": 1, "state": "skip"},
+        {"movie_id": 1, "state": "watchlist", "user_id": 1},
+        {"movie_id": 1, "state": "watchlist", "skip": True},
+    ],
+)
+def test_feedback_input_rejects_user_id_skip_and_non_integer(body):
+    from pydantic import ValidationError
+
+    from recsys_api.schemas import FeedbackIn
+
+    with pytest.raises(ValidationError):
+        FeedbackIn.model_validate(body)
+
+
+def test_movieout_metadata_optional():
+    from api_fakes import make_catalog_movies
+
+    from recsys_api.schemas import MovieOut
+
+    assert MovieOut.of(make_catalog_movies()[0]).poster_url is None
+
+
+def test_existing_cookie_restores_full_history(client):
+    for mid in (1, 2, 3, 4, 60):
+        assert rate(client, mid).status_code == 200
+    rate(client, 1, 2)
+    restored = client.get("/ratings")
+    assert restored.status_code == 200
+    data = restored.json()
+    assert data["n_ratings"] == 5 and data["min_ratings"] == 5
+    assert {m["movie_id"]: m["user_rating"] for m in data["items"]} == {
+        1: 2,
+        2: 5,
+        3: 5,
+        4: 5,
+        60: 5,
+    }
+
+
+def test_feedback_first_cookie_isolation_and_rating_wins():
+    repo = FakeRepository()
+    with make_client(repo=repo) as alice, make_client(repo=repo) as bob:
+        first = alice.post("/feedback", json={"movie_id": 60, "state": "watchlist"})
+        assert first.status_code == 200 and "HttpOnly" in first.headers["set-cookie"]
+        assert alice.get("/ratings").json()["n_ratings"] == 0
+        assert [m["movie_id"] for m in alice.get("/watchlist").json()["items"]] == [60]
+        assert bob.get("/watchlist").json()["items"] == []
+        assert bob.delete("/watchlist/60").status_code == 204
+        assert alice.get("/watchlist").json()["items"]
+        assert rate(alice, 60).status_code == 200
+        assert alice.get("/watchlist").json()["items"] == []
+        assert (
+            alice.post("/feedback", json={"movie_id": 60, "state": "watchlist"}).status_code == 409
+        )
+        assert alice.delete("/watchlist/60").status_code == 204
+        assert alice.delete("/watchlist/60").status_code == 204
+
+
+def test_history_failure_is_503_and_keeps_cookie():
+    repo = FakeRepository()
+    with make_client(repo=repo) as c:
+        rate(c, 1)
+        cookie = c.cookies.get(COOKIE_NAME)
+        repo.down = True
+        assert c.get("/ratings").status_code == 503
+        assert c.get("/watchlist").status_code == 503
+        assert c.cookies.get(COOKIE_NAME) == cookie
+
+
+def test_metadata_in_every_movie_response():
+    from recsys.movie_metadata import MovieMetadata
+    from recsys_api.metadata import MetadataHolder
+
+    holder = MetadataHolder()
+    holder.current = {60: MovieMetadata(60, 600, "/sample.jpg", "Русское название")}
+    settings = Settings(session_secret=SESSION_SECRET, impressions_enabled=False)
+    registry = Registry()
+    app = create_app(
+        settings,
+        repo=FakeRepository(),
+        store=FakeStore(),
+        loader=registry.load,
+        probe=registry.probe,
+        background=False,
+        metadata_holder=holder,
+    )
+    with TestClient(app) as c:
+
+        def localized(items):
+            item = next(m for m in items if m["movie_id"] == 60)
+            assert item["title"] == "Русское название"
+            assert item["poster_url"] == "https://image.tmdb.org/t/p/w500/sample.jpg"
+
+        localized(c.get("/movies/search?q=Русское").json()["items"])
+        localized(c.get("/movies/search?q=Movie%2060").json()["items"])
+        c.post("/feedback", json={"movie_id": 60, "state": "watchlist"})
+        localized(c.get("/watchlist").json()["items"])
+        rate(c, 60)
+        localized(c.get("/ratings").json()["items"])
+        for mid in (1, 2, 3, 4):
+            rate(c, mid)
+        holder.current[59] = MovieMetadata(59, 599, "/other.jpg", "Другое название")
+        items = c.get("/recommendations").json()["items"]
+        assert items[0]["title"] == "Другое название"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"movie_id": 1, "state": "skip"},
+        {"movie_id": 1, "state": "watchlist", "user_id": 4},
+        {"movie_id": 1.0, "state": "dismissed"},
+        {"movie_id": 999, "state": "watchlist"},
+    ],
+)
+def test_http_feedback_validation(client, body):
+    assert client.post("/feedback", json=body).status_code == 422
+    assert not client.cookies.get(COOKIE_NAME)
+
+
+def test_feedback_shares_mutation_limit():
+    with make_client(rate_limit_per_minute=2) as c:
+        assert rate(c, 1).status_code == 200
+        assert c.post("/feedback", json={"movie_id": 2, "state": "watchlist"}).status_code == 200
+        response = c.delete("/watchlist/2")
+        assert response.status_code == 429 and response.headers["Retry-After"] == "60"
+
+
+def test_restore_waits_for_complete_catalog():
+    repo = FakeRepository()
+    repo.ratings[WEB_USER_ID_START] = {1: 5, 2: 4, 3: 3, 4: 4, 5: 5}
+    repo.feedback_data[WEB_USER_ID_START] = {60: "watchlist"}
+    with make_client(repo=repo) as c:
+        c.cookies.set(COOKIE_NAME, CookieSigner(SESSION_SECRET).sign(WEB_USER_ID_START))
+        from recsys_api.catalog import Catalog
+
+        c.app.state.catalog.current = Catalog([])
+        assert c.get("/ratings").status_code == 503
+        assert c.get("/watchlist").status_code == 503
+        c.app.state.catalog.current = Catalog(repo.movies[:3])
+        assert c.get("/ratings").status_code == 503
+        assert c.get("/watchlist").status_code == 503
+        c.app.state.catalog.current = Catalog(repo.movies)
+        assert c.get("/ratings").json()["n_ratings"] == 5
+        assert len(c.get("/watchlist").json()["items"]) == 1

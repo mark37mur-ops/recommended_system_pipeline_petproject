@@ -9,6 +9,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeout
 
 from recsys.db.schema import (
     create_schema,
+    movie_feedback,
     movies,
     ratings,
     recommendation_impressions,
@@ -16,7 +17,13 @@ from recsys.db.schema import (
     web_user_id_seq,
 )
 from recsys_api.catalog import Movie
-from recsys_api.service import DatabaseUnavailable, RatingQuotaExceeded, UserNotFound
+from recsys_api.service import (
+    DatabaseUnavailable,
+    FeedbackState,
+    MovieAlreadyRated,
+    RatingQuotaExceeded,
+    UserNotFound,
+)
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +110,66 @@ class PgRepository:
 
         return self._guard(run)
 
+    @staticmethod
+    def _lock_web_user(conn, user_id: int) -> None:
+        locked = conn.execute(
+            select(users.c.user_id)
+            .where(users.c.user_id == user_id, users.c.source == "web")
+            .with_for_update()
+        ).first()
+        if locked is None:
+            raise UserNotFound(user_id)
+
+    def user_feedback(self, user_id: int) -> dict[int, FeedbackState]:
+        query = (
+            select(movie_feedback.c.movie_id, movie_feedback.c.state)
+            .where(movie_feedback.c.user_id == user_id)
+            .order_by(movie_feedback.c.updated_at.desc(), movie_feedback.c.movie_id)
+        )
+
+        def run():
+            with self.engine.connect() as conn:
+                return {int(movie_id): state for movie_id, state in conn.execute(query)}
+
+        return self._guard(run)
+
+    def upsert_feedback(self, user_id: int, movie_id: int, state: FeedbackState) -> None:
+        def run():
+            with self.engine.begin() as conn:
+                self._lock_web_user(conn, user_id)
+                rated = conn.execute(
+                    select(ratings.c.movie_id).where(
+                        ratings.c.user_id == user_id, ratings.c.movie_id == movie_id
+                    )
+                ).first()
+                if rated is not None:
+                    raise MovieAlreadyRated(movie_id)
+                stmt = insert(movie_feedback).values(
+                    user_id=user_id, movie_id=movie_id, state=state, updated_at=func.now()
+                )
+                conn.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[movie_feedback.c.user_id, movie_feedback.c.movie_id],
+                        set_={"state": stmt.excluded.state, "updated_at": func.now()},
+                    )
+                )
+
+        self._guard(run)
+
+    def delete_watchlist(self, user_id: int, movie_id: int) -> None:
+        def run():
+            with self.engine.begin() as conn:
+                self._lock_web_user(conn, user_id)
+                conn.execute(
+                    movie_feedback.delete().where(
+                        movie_feedback.c.user_id == user_id,
+                        movie_feedback.c.movie_id == movie_id,
+                        movie_feedback.c.state == "watchlist",
+                    )
+                )
+
+        self._guard(run)
+
     def upsert_rating(self, user_id: int, movie_id: int, rating: int, max_ratings: int) -> int:
         """Upsert under a row lock on the user, so concurrent ratings of one user cannot both
         pass the quota check (spec 3.4: at most `max_ratings` ratings per user). Only web users
@@ -111,13 +178,7 @@ class PgRepository:
 
         def run():
             with self.engine.begin() as conn:
-                locked = conn.execute(
-                    select(users.c.user_id)
-                    .where(users.c.user_id == user_id, users.c.source == "web")
-                    .with_for_update()
-                ).first()
-                if locked is None:
-                    raise UserNotFound(user_id)
+                self._lock_web_user(conn, user_id)
                 own = select(func.count()).where(ratings.c.user_id == user_id)
                 n_before = conn.execute(own).scalar_one()
                 exists = conn.execute(
@@ -127,6 +188,12 @@ class PgRepository:
                 ).first()
                 if exists is None and n_before >= max_ratings:
                     raise RatingQuotaExceeded(user_id)
+                conn.execute(
+                    movie_feedback.delete().where(
+                        movie_feedback.c.user_id == user_id,
+                        movie_feedback.c.movie_id == movie_id,
+                    )
+                )
                 stmt = insert(ratings).values(
                     user_id=user_id,
                     movie_id=movie_id,

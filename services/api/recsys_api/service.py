@@ -7,15 +7,15 @@ Paths (the `path` label of spec 5.1):
 - `full`: >= 5 ratings -> fold-in ALS + ranker on the visitor's own ratings
   (`recommend_new_user`; stored ALS factors are never used by id, so web ids are irrelevant
   to the model), padded with popular movies if the model returns fewer than MAX_K;
-- `fallback`: no model, the model failed or returned nothing, or Postgres is down without a
-  cached answer -> popular. Fallback answers are not cached.
+- `fallback`: no model, the model failed or returned nothing -> eligible popular. If an
+  identified visitor's exclusions cannot be read, return no ids. Fallbacks are not cached.
 """
 
 import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from recsys.db.schema import WEB_USER_ID_START
 from recsys_api.cache import CachedRecs, RateLimiter, RecommendationCache
@@ -29,6 +29,7 @@ MIN_PERSONAL_RATINGS = 5
 MAX_K = 50  # computed and cached once per user; the response is cut to the requested k
 MAX_RATINGS_PER_USER = 300
 NO_MODEL_VERSION = "none"
+FeedbackState = Literal["watchlist", "dismissed"]
 
 
 class DatabaseUnavailable(Exception):
@@ -51,6 +52,10 @@ class UnknownMovie(Exception):
     pass
 
 
+class MovieAlreadyRated(Exception):
+    pass
+
+
 class Repository(Protocol):
     """Access to the `app` database. Connection problems raise DatabaseUnavailable."""
 
@@ -58,6 +63,9 @@ class Repository(Protocol):
     def load_movies(self) -> list[Movie]: ...
     def user_ratings(self, user_id: int) -> list[tuple[int, int]]: ...
     def create_web_user(self) -> int: ...
+    def user_feedback(self, user_id: int) -> dict[int, FeedbackState]: ...
+    def upsert_feedback(self, user_id: int, movie_id: int, state: FeedbackState) -> None: ...
+    def delete_watchlist(self, user_id: int, movie_id: int) -> None: ...
     def upsert_rating(self, user_id: int, movie_id: int, rating: int, max_ratings: int) -> int:
         """Insert or update one rating, return the user's rating count. Raises UserNotFound,
         RatingQuotaExceeded (new movie while the user already has `max_ratings`)."""
@@ -80,6 +88,14 @@ class RatingResult:
     movie_id: int
     rating: int
     n_ratings: int
+
+
+@dataclass(frozen=True)
+class FeedbackResult:
+    user_id: int
+    created_user: bool
+    movie_id: int
+    state: FeedbackState
 
 
 def _web_user(user_id: int | None) -> int | None:
@@ -123,24 +139,38 @@ class RecommendationService:
         cache_version = version or NO_MODEL_VERSION
         cached = self.cache.get(user_id, cache_version)
         self.observer.cache_lookup(cached is not None)
-        if cached is not None:
-            return self._serve(
-                user_id, cached.movie_ids[:k], cached.path, version, cached.n_ratings, True
-            )
-
         generation = self.cache.generation(user_id)
         try:
             ratings = self.repo.user_ratings(user_id)
+            feedback = self.repo.user_feedback(user_id)
         except DatabaseUnavailable as exc:
-            log.warning("ratings of user %s unavailable, serving popular: %s", user_id, exc)
-            return self._serve(user_id, catalog.popular(k), "fallback", version, None, False)
+            log.warning("exclusions of user %s unavailable: %s", user_id, exc)
+            return self._serve(user_id, [], "fallback", version, None, False)
+
+        excluded = {m for m, _ in ratings} | set(feedback)
+        if cached is not None:
+            return self._serve(
+                user_id,
+                self._eligible(cached.movie_ids, catalog, excluded, k),
+                cached.path,
+                version,
+                len(ratings),
+                True,
+            )
 
         movie_ids, path = self._compute(ratings, model, catalog)
+        movie_ids = self._eligible(movie_ids, catalog, excluded, MAX_K)
         if path != "fallback":
             self.cache.put(
                 user_id, cache_version, CachedRecs(movie_ids, path, len(ratings)), generation
             )
         return self._serve(user_id, movie_ids[:k], path, version, len(ratings), False)
+
+    @staticmethod
+    def _eligible(movie_ids: list[int], catalog: Catalog, excluded: set[int], k: int) -> list[int]:
+        """Filter every serving path and refill from the entire popularity snapshot."""
+        out = list(dict.fromkeys(m for m in movie_ids if m in catalog and m not in excluded))[:k]
+        return out + catalog.popular(k - len(out), exclude=excluded | set(out))
 
     def _compute(
         self, ratings: list[tuple[int, int]], model: LoadedModel | None, catalog: Catalog
@@ -183,14 +213,7 @@ class RecommendationService:
     def rate(self, user_id: int | None, ip: str, movie_id: int, rating: int) -> RatingResult:
         """Validate, rate-limit and upsert one rating; creates the web user on first rating."""
         user_id = _web_user(user_id)
-        catalog = self.catalog()
-        if len(catalog) == 0:
-            raise DatabaseUnavailable("movie catalog is not loaded")
-        if movie_id not in catalog:
-            raise UnknownMovie(movie_id)
-        keys = [f"ip:{ip}"] + ([f"user:{user_id}"] if user_id is not None else [])
-        if not self.limiter.allow(keys):
-            raise RateLimited()
+        self._check_mutation(user_id, ip, movie_id)
 
         created = user_id is None
         if user_id is None:
@@ -201,8 +224,7 @@ class RecommendationService:
             user_id, created = self.repo.create_web_user(), True
             n_ratings = self.repo.upsert_rating(user_id, movie_id, rating, self.max_ratings)
 
-        model = self.models.current
-        self.cache.invalidate(user_id, model.version if model else NO_MODEL_VERSION)
+        self._invalidate(user_id)
         self.observer.rating_received("web")
         return RatingResult(user_id, created, movie_id, rating, n_ratings)
 
@@ -215,3 +237,55 @@ class RecommendationService:
             return dict(self.repo.user_ratings(user_id))
         except DatabaseUnavailable:
             return {}
+
+    def rating_history(self, user_id: int | None) -> dict[int, int]:
+        """Strict history: a failed read must not masquerade as a new visitor."""
+        user_id = _web_user(user_id)
+        return {} if user_id is None else dict(self.repo.user_ratings(user_id))
+
+    def feedback(self, user_id: int | None) -> dict[int, FeedbackState]:
+        user_id = _web_user(user_id)
+        return {} if user_id is None else self.repo.user_feedback(user_id)
+
+    def _check_mutation(self, user_id: int | None, ip: str, movie_id: int) -> None:
+        catalog = self.catalog()
+        if not len(catalog):
+            raise DatabaseUnavailable("movie catalog is not loaded")
+        if movie_id not in catalog:
+            raise UnknownMovie(movie_id)
+        keys = [f"ip:{ip}"] + ([f"user:{user_id}"] if user_id is not None else [])
+        if not self.limiter.allow(keys):
+            raise RateLimited()
+
+    def _invalidate(self, user_id: int) -> None:
+        model = self.models.current
+        self.cache.invalidate(user_id, model.version if model else NO_MODEL_VERSION)
+
+    def set_feedback(
+        self, user_id: int | None, ip: str, movie_id: int, state: FeedbackState
+    ) -> FeedbackResult:
+        if state not in ("watchlist", "dismissed"):
+            raise ValueError("invalid feedback state")
+        user_id = _web_user(user_id)
+        self._check_mutation(user_id, ip, movie_id)
+        created = user_id is None
+        if user_id is None:
+            user_id = self.repo.create_web_user()
+        try:
+            self.repo.upsert_feedback(user_id, movie_id, state)
+        except UserNotFound:
+            user_id, created = self.repo.create_web_user(), True
+            self.repo.upsert_feedback(user_id, movie_id, state)
+        self._invalidate(user_id)
+        return FeedbackResult(user_id, created, movie_id, state)
+
+    def remove_watchlist(self, user_id: int | None, ip: str, movie_id: int) -> None:
+        user_id = _web_user(user_id)
+        if user_id is None:
+            return
+        self._check_mutation(user_id, ip, movie_id)
+        try:
+            self.repo.delete_watchlist(user_id, movie_id)
+        except UserNotFound:
+            return  # an absent user has no watchlist, and deletion never creates one
+        self._invalidate(user_id)

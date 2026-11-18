@@ -64,6 +64,10 @@ if [ "$1" = compose ]; then
   case $args in
     *" pull "*)
       if in_list "$(tag)" "${FAKE_BAD_PULL_TAGS:-}"; then echo "pull failed" >&2; exit 1; fi ;;
+    *" up -d --wait postgres "*)
+      touch "$FAKE_STATE/postgres-ready" ;;
+    *" run --rm --no-deps db-init "*)
+      touch "$FAKE_STATE/db-initialized" ;;
     *" up "*)
       printf 'up %s\n' "$(tag)" >> "$FAKE_LOG"
       tag > "$FAKE_STATE/running" ;;

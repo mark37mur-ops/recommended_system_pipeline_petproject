@@ -44,7 +44,8 @@ def db(engine):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE ratings, users, movies, retrain_runs, recommendation_impressions, "
+                "TRUNCATE movie_feedback, movie_metadata, ratings, users, movies, retrain_runs, "
+                "recommendation_impressions, "
                 "drift_metrics, run_metrics"
             )
         )

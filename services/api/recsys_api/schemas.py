@@ -1,8 +1,13 @@
 """Request and response models (spec 3.4 point 1: Pydantic validation)."""
 
+from typing import TYPE_CHECKING, Literal
+
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from recsys_api.catalog import Movie
+
+if TYPE_CHECKING:
+    from recsys.movie_metadata import MovieMetadata
 
 
 class RatingIn(BaseModel):
@@ -26,15 +31,23 @@ class MovieOut(BaseModel):
     year: int | None
     genres: list[str]
     user_rating: int | None = None
+    poster_url: str | None = None
 
     @classmethod
-    def of(cls, movie: Movie, user_rating: int | None = None) -> "MovieOut":
+    def of(
+        cls, movie: Movie, user_rating: int | None = None, metadata: "MovieMetadata | None" = None
+    ) -> "MovieOut":
+        from recsys.movie_metadata import poster_url
+
         return cls(
             movie_id=movie.movie_id,
-            title=movie.display_title,
+            title=(metadata.title_ru or "").strip() or movie.display_title
+            if metadata
+            else movie.display_title,
             year=movie.year,
             genres=list(movie.genres),
             user_rating=user_rating,
+            poster_url=poster_url(metadata.poster_path) if metadata else None,
         )
 
 
@@ -57,3 +70,19 @@ class ReloadOut(BaseModel):
     previous_version: str | None
     error: str | None
     catalog_size: int | None
+
+
+class FeedbackIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    movie_id: StrictInt = Field(gt=0)
+    state: Literal["watchlist", "dismissed"]
+
+
+class FeedbackOut(BaseModel):
+    movie_id: int
+    state: Literal["watchlist", "dismissed"]
+
+
+class RatingsOut(MovieList):
+    n_ratings: int
+    min_ratings: int
